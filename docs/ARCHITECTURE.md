@@ -165,6 +165,10 @@ When the repository layer creates a snapshot, it accepts structured provenance m
 
 This metadata is stored as part of the snapshot object and indexed for queryability. Provenance is the substrate that makes auditing agent work possible.
 
+### Tracing and Diagnostics
+
+Era uses structured `tracing` instrumentation for debugging, performance testing, and future operational visibility. Tracing is off by default for script-friendly command behavior and can be enabled with `ERA_LOG` or `RUST_LOG`. I/O-heavy components such as object storage and materialization should emit spans/events with object IDs, paths, byte counts, and reuse/write decisions, while avoiding raw file contents.
+
 ---
 
 ## User Flows

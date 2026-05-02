@@ -9,6 +9,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use tokio::{fs, fs::OpenOptions, io::AsyncWriteExt};
+use tracing::{debug, warn};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -43,12 +44,14 @@ impl LocalObjectStore {
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, ObjectStoreError> {
         let root = root.into();
         let blobs = root.join("blobs");
+        debug!(root = %root.display(), "opening local object store");
         fs::create_dir_all(&blobs)
             .await
             .map_err(|source| ObjectStoreError::Io {
                 path: blobs,
                 source,
             })?;
+        debug!(root = %root.display(), "local object store ready");
         Ok(Self { root })
     }
 
@@ -88,6 +91,7 @@ impl LocalObjectStore {
     async fn put_blob_bytes(&self, bytes: &[u8]) -> Result<ObjectId, ObjectStoreError> {
         let id = ObjectId::from_content(bytes);
         let path = self.blob_path(&id);
+        debug!(%id, bytes = bytes.len(), path = %path.display(), "storing blob");
 
         if fs::try_exists(&path)
             .await
@@ -97,7 +101,10 @@ impl LocalObjectStore {
             })?
         {
             match self.verify_blob_file(&path, id).await {
-                Ok(()) => return Ok(id),
+                Ok(()) => {
+                    debug!(%id, "blob already present; reusing existing object");
+                    return Ok(id);
+                }
                 Err(ObjectStoreError::MissingBlob { .. }) => {}
                 Err(error) => return Err(error),
             }
@@ -115,11 +122,13 @@ impl LocalObjectStore {
         match fs::hard_link(&temp_path, &path).await {
             Ok(()) => {
                 remove_temp_file(&temp_path).await?;
+                debug!(%id, path = %path.display(), "stored new blob object");
                 Ok(id)
             }
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                 remove_temp_file(&temp_path).await?;
                 self.verify_blob_file(&path, id).await?;
+                debug!(%id, "blob appeared during concurrent write; reusing existing object");
                 Ok(id)
             }
             Err(source) => {
@@ -131,9 +140,11 @@ impl LocalObjectStore {
 
     async fn get_blob_bytes(&self, id: &ObjectId) -> Result<Vec<u8>, ObjectStoreError> {
         let path = self.blob_path(id);
+        debug!(%id, path = %path.display(), "reading blob");
         let bytes = read_blob_file(&path, *id).await?;
         let actual = ObjectId::from_content(&bytes);
         if actual != *id {
+            warn!(%id, %actual, path = %path.display(), "blob failed integrity check on read");
             return Err(ObjectStoreError::HashMismatch {
                 path,
                 expected: *id,
@@ -145,6 +156,7 @@ impl LocalObjectStore {
 
     async fn contains_blob_bytes(&self, id: &ObjectId) -> Result<bool, ObjectStoreError> {
         let path = self.blob_path(id);
+        debug!(%id, path = %path.display(), "checking blob presence");
         match self.verify_blob_file(&path, *id).await {
             Ok(()) => Ok(true),
             Err(ObjectStoreError::MissingBlob { .. }) => Ok(false),
@@ -162,6 +174,7 @@ impl LocalObjectStore {
             let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
             let temp_path = parent.join(format!(".{id}.{}.{counter}.tmp", std::process::id()));
 
+            debug!(%id, temp_path = %temp_path.display(), "writing temporary blob file");
             let mut file = match OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -212,6 +225,7 @@ impl LocalObjectStore {
         let bytes = read_blob_file(path, expected).await?;
         let actual = ObjectId::from_content(bytes);
         if actual != expected {
+            warn!(%expected, %actual, path = %path.display(), "blob failed integrity verification");
             return Err(ObjectStoreError::HashMismatch {
                 path: path.to_path_buf(),
                 expected,
@@ -322,6 +336,9 @@ async fn remove_temp_file(path: &Path) -> Result<(), ObjectStoreError> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test(flavor = "current_thread")]
     async fn open_creates_store_directories() {
@@ -469,7 +486,237 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn blob_store_trait_object_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalObjectStore::open(temp.path().join("objects"))
+            .await
+            .unwrap();
+        let store: &dyn BlobStore = &store;
+
+        let id = store.put_blob(b"via trait").await.unwrap();
+
+        assert_eq!(store.get_blob(&id).await.unwrap(), b"via trait");
+        assert!(store.contains_blob(&id).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_blob_round_trips() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalObjectStore::open(temp.path().join("objects"))
+            .await
+            .unwrap();
+        let bytes: Vec<u8> = (0..(4 * 1024 * 1024))
+            .map(|index| (index % 251) as u8)
+            .collect();
+
+        let id = store.put_blob(&bytes).await.unwrap();
+
+        assert_eq!(id, ObjectId::from_content(&bytes));
+        assert_eq!(store.get_blob(&id).await.unwrap(), bytes);
+        assert_eq!(blob_file_count(store.root()).await, 1);
+        assert_eq!(temp_file_count(store.root()).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_of_same_blob_dedupe_and_cleanup_temps() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalObjectStore::open(temp.path().join("objects"))
+            .await
+            .unwrap();
+        let expected = ObjectId::from_content(b"concurrent");
+
+        let mut handles = Vec::new();
+        for _ in 0..64 {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                store.put_blob(b"concurrent").await.unwrap()
+            }));
+        }
+
+        for handle in handles {
+            assert_eq!(handle.await.unwrap(), expected);
+        }
+
+        assert_eq!(store.get_blob(&expected).await.unwrap(), b"concurrent");
+        assert_eq!(blob_file_count(store.root()).await, 1);
+        assert_eq!(temp_file_count(store.root()).await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_of_distinct_blobs_all_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalObjectStore::open(temp.path().join("objects"))
+            .await
+            .unwrap();
+        let payloads: Vec<Vec<u8>> = (0..32)
+            .map(|index| format!("distinct blob {index}").into_bytes())
+            .collect();
+
+        let mut handles = Vec::new();
+        for payload in payloads.clone() {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                let id = store.put_blob(&payload).await.unwrap();
+                (id, payload)
+            }));
+        }
+
+        for handle in handles {
+            let (id, payload) = handle.await.unwrap();
+            assert_eq!(id, ObjectId::from_content(&payload));
+            assert_eq!(store.get_blob(&id).await.unwrap(), payload);
+        }
+
+        assert_eq!(blob_file_count(store.root()).await, payloads.len());
+        assert_eq!(temp_file_count(store.root()).await, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_fails_when_root_path_is_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("objects");
+        fs::write(&root, b"not a directory").await.unwrap();
+
+        let error = LocalObjectStore::open(&root).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ObjectStoreError::Io { path, source }
+                if path == root.join("blobs")
+                    && matches!(
+                        source.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+                    )
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_fails_when_blobs_path_is_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("objects");
+        fs::create_dir(&root).await.unwrap();
+        let blobs = root.join("blobs");
+        fs::write(&blobs, b"not a directory").await.unwrap();
+
+        let error = LocalObjectStore::open(&root).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ObjectStoreError::Io { path, source }
+                if path == blobs
+                    && matches!(
+                        source.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+                    )
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn put_blob_fails_when_shard_path_is_file() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalObjectStore::open(temp.path().join("objects"))
+            .await
+            .unwrap();
+        let id = ObjectId::from_content(b"hello");
+        let shard_path = store.root().join("blobs").join(id.shard_prefix());
+        fs::write(&shard_path, b"not a directory").await.unwrap();
+
+        let error = store.put_blob(b"hello").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ObjectStoreError::Io { source, .. }
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+                )
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_blob_reports_io_error_when_blob_path_is_directory() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalObjectStore::open(temp.path().join("objects"))
+            .await
+            .unwrap();
+        let id = ObjectId::from_content(b"directory instead of file");
+        fs::create_dir_all(store.blob_path(&id)).await.unwrap();
+
+        let error = store.get_blob(&id).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ObjectStoreError::Io { source, .. }
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::IsADirectory | io::ErrorKind::PermissionDenied
+                )
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_reports_permission_denied_when_parent_is_not_writable() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("readonly");
+        fs::create_dir(&parent).await.unwrap();
+        set_mode(&parent, 0o500);
+
+        let result = LocalObjectStore::open(parent.join("objects")).await;
+
+        set_mode(&parent, 0o700);
+        match result {
+            Err(ObjectStoreError::Io { source, .. }) => {
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Ok(_) => {
+                eprintln!(
+                    "permission assertion skipped: process can create files in a non-writable directory"
+                );
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_blob_reports_permission_denied_when_blob_is_not_readable() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalObjectStore::open(temp.path().join("objects"))
+            .await
+            .unwrap();
+        let id = store.put_blob(b"secret").await.unwrap();
+        let path = store.blob_path(&id);
+        set_mode(&path, 0o000);
+
+        let result = store.get_blob(&id).await;
+
+        set_mode(&path, 0o600);
+        match result {
+            Err(ObjectStoreError::Io { source, .. }) => {
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Ok(bytes) => {
+                assert_eq!(bytes, b"secret");
+                eprintln!(
+                    "permission assertion skipped: process can read a file with no read bits"
+                );
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        }
+    }
+
     async fn blob_file_count(root: &Path) -> usize {
+        count_files_matching(root, |name| !name.ends_with(".tmp")).await
+    }
+
+    async fn temp_file_count(root: &Path) -> usize {
+        count_files_matching(root, |name| name.ends_with(".tmp")).await
+    }
+
+    async fn count_files_matching(root: &Path, matches_name: fn(&str) -> bool) -> usize {
         let blobs = root.join("blobs");
         let mut count = 0;
         let mut shards = fs::read_dir(blobs).await.unwrap();
@@ -481,12 +728,23 @@ mod tests {
 
             let mut files = fs::read_dir(shard.path()).await.unwrap();
             while let Some(file) = files.next_entry().await.unwrap() {
-                if file.file_type().await.unwrap().is_file() {
+                if !file.file_type().await.unwrap().is_file() {
+                    continue;
+                }
+
+                let name = file.file_name();
+                if matches_name(&name.to_string_lossy()) {
                     count += 1;
                 }
             }
         }
 
         count
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(path, permissions).unwrap();
     }
 }

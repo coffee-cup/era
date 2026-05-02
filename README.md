@@ -25,6 +25,17 @@ This repository uses [`mise`](https://mise.jdx.dev/) to manage tools and run tas
 mise install
 ```
 
+## Tracing
+
+Runtime tracing is off by default. Enable it with `ERA_LOG` or `RUST_LOG`:
+
+```sh
+ERA_LOG=debug cargo run -p era-cli --bin era
+ERA_LOG=era_object_store=trace cargo test -p era-object-store -- --nocapture
+```
+
+Tracing output is written to stderr so command stdout stays script-friendly.
+
 ## Development
 
 Run commands from the repository root through `mise`:

@@ -9,6 +9,7 @@ This plan tracks the first non-bootstrap slices for Era. The goal is to build on
 - Prefer deterministic behavior over background magic until the core is proven.
 - Add tests with every behavior change.
 - Keep performance in mind from the first primitive: avoid redundant writes, use stable hashes, and keep layouts scalable.
+- Use `tracing` for operational and performance visibility. Runtime tracing should be off by default and toggleable through `ERA_LOG` or `RUST_LOG`.
 
 ## Current slice: object identity and blob storage
 
@@ -30,7 +31,7 @@ Status: implemented in the first non-bootstrap pass.
   - integrity verification on reads
   - corruption detection instead of silent overwrite
 
-Important boundary rule: filesystem calls belong inside storage/materialization implementations. Repository and CLI code should depend on async capabilities, not direct `std::fs` access to the working tree.
+Important boundary rule: filesystem calls belong inside storage/materialization implementations. Repository and CLI code should depend on async capabilities, not direct `std::fs` access to the working tree. Instrument I/O-heavy paths with `tracing` spans/events so agents can debug behavior and performance without adding ad-hoc prints.
 
 ## Next slices
 
