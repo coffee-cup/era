@@ -120,6 +120,14 @@ dependencies = [
 [[package]]
 name = "era-materialization"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "era-core",
+ "era-object-store",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "era-object-store"

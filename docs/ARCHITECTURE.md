@@ -112,6 +112,8 @@ Responsibilities:
 
 In v0, materialization works by ordinary file operations — copying bytes from the object store onto the filesystem, walking the working tree to detect changes, and using a platform-appropriate filesystem watcher to observe writes. The materialization API should still be async and capability-oriented from the start, so repository code does not depend on the copy-based implementation detail.
 
+The current implementation covers the capture direction only: `FilesystemMaterializer` walks a working directory, stores regular files as blobs, stores directories as trees, and returns the captured root tree ID with stats and non-fatal issues. Capture uses configurable exact directory-name exclusions; defaults skip Era metadata, Git metadata, and common generated/transient directories such as `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`. Symlinks are not followed; by default they are skipped and reported, and callers can choose an error policy instead.
+
 This layer is intentionally a replaceable component. Future implementations (hardlink-based, reflink-based, FUSE-based) will plug in here without changing anything above. The interface this layer presents to the repository is small and stable: "checkout this snapshot at this path," "what does this path look like now," "tell me when something changes."
 
 ### Repository

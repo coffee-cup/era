@@ -15,7 +15,7 @@ The v0 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.
 
 ## Current status
 
-The implemented foundation is the content-addressed object layer: BLAKE3 object IDs and deterministic tree types in `era-core`, plus an async local blob/tree store in `era-object-store`. Higher-level materialization, snapshots, repository metadata, and CLI workflows are tracked in [`docs/PLAN.md`](docs/PLAN.md).
+The implemented foundation is the content-addressed object layer plus working-directory capture: BLAKE3 object IDs and deterministic tree types in `era-core`, an async local blob/tree store in `era-object-store`, and a configurable filesystem scanner in `era-materialization`. Snapshots, repository metadata, and CLI workflows are tracked in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Prerequisites
 

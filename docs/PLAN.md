@@ -11,7 +11,9 @@ This plan tracks the first non-bootstrap slices for Era. The goal is to build on
 - Keep performance in mind from the first primitive: avoid redundant writes, use stable hashes, and keep layouts scalable.
 - Use `tracing` for operational and performance visibility. Runtime tracing should be off by default and toggleable through `ERA_LOG` or `RUST_LOG`.
 
-## Current slice: object identity, blob storage, and tree storage
+## Implemented slices
+
+### Object identity, blob storage, and tree storage
 
 Status: implemented.
 
@@ -35,24 +37,22 @@ Status: implemented.
   - canonical tree validation
   - corruption detection instead of silent overwrite
 
+### Materialization scan
+
+Status: implemented.
+
+- `era-materialization` owns an async `Materializer` trait and a copy-based `FilesystemMaterializer`.
+- `FilesystemMaterializer` captures a working directory into blob and tree objects and returns the root tree ID, capture stats, and non-fatal issues.
+- Capture options provide configurable exact directory-name exclusions. Defaults skip `.era`, `.git`, `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`.
+- Symlinks are not followed. The default policy skips them and records issues; callers can configure symlinks to return an error.
+- The scan handles nested directories, empty directories, empty files, deletes between captures, emoji and non-English UTF-8 paths, and deterministic tree output.
+- Checkout/materialize-from-tree, filesystem watching, and hash caching remain future materialization work.
+
 Important boundary rule: filesystem calls belong inside storage/materialization implementations. Repository and CLI code should depend on async capabilities, not direct `std::fs` access to the working tree. Instrument I/O-heavy paths with `tracing` spans/events so agents can debug behavior and performance without adding ad-hoc prints.
 
 ## Next slices
 
-### 1. Materialization scan
-
-Teach `era-materialization` to scan a working directory into blob and tree objects. Start this slice by defining a narrow async materializer trait before adding the copy-based implementation.
-
-Focus:
-
-- Keep the trait capability-oriented: materialize a tree/snapshot, report current tree state, and surface changes.
-- Exclude `.era/`, `.git/`, `target/`, and common transient directories.
-- Preserve relative paths safely.
-- Handle added, modified, deleted, empty, and nested files.
-- Return useful capture stats.
-- Add a simple hash cache after the scan path is correct.
-
-### 2. Repository init and manual snapshot
+### 1. Repository init and manual snapshot
 
 Teach `era-repository` to create repository metadata and capture explicit snapshots.
 
@@ -64,7 +64,7 @@ Focus:
 - initial snapshot and subsequent manual snapshots.
 - timeline walking from the current branch.
 
-### 3. Thin CLI
+### 2. Thin CLI
 
 Expose only the workflows needed to play with the system.
 
@@ -85,7 +85,7 @@ era switch NAME
 era restore SNAPSHOT_OR_LABEL
 ```
 
-### 4. Agent-facing eval flows
+### 3. Agent-facing eval flows
 
 Add markdown evals/scripts that another Pi agent can run against a temp project.
 
