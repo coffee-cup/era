@@ -36,6 +36,7 @@ pub struct CaptureOptions {
 
 impl CaptureOptions {
     /// Creates options with no excluded directory names and default symlink handling.
+    #[must_use]
     pub fn no_exclusions() -> Self {
         Self {
             excluded_directory_names: BTreeSet::new(),
@@ -44,34 +45,40 @@ impl CaptureOptions {
     }
 
     /// Returns the exact directory names skipped during capture.
+    #[must_use]
     pub fn excluded_directory_names(&self) -> &BTreeSet<String> {
         &self.excluded_directory_names
     }
 
     /// Returns `true` if a directory with this exact name should be skipped.
+    #[must_use]
     pub fn excludes_directory_name(&self, name: &str) -> bool {
         self.excluded_directory_names.contains(name)
     }
 
     /// Adds an exact directory name to skip during capture.
+    #[must_use]
     pub fn with_excluded_directory(mut self, name: impl Into<String>) -> Self {
         self.excluded_directory_names.insert(name.into());
         self
     }
 
     /// Removes an exact directory name from the skip list.
+    #[must_use]
     pub fn without_excluded_directory(mut self, name: &str) -> Self {
         self.excluded_directory_names.remove(name);
         self
     }
 
     /// Sets how symlinks are handled during capture.
+    #[must_use]
     pub fn with_symlink_policy(mut self, policy: SymlinkPolicy) -> Self {
         self.symlink_policy = policy;
         self
     }
 
     /// Returns how symlinks are handled during capture.
+    #[must_use]
     pub fn symlink_policy(&self) -> SymlinkPolicy {
         self.symlink_policy
     }
@@ -112,6 +119,7 @@ pub struct CaptureResult {
 
 impl CaptureResult {
     /// Creates a capture result.
+    #[must_use]
     pub fn new(root_tree_id: ObjectId, stats: CaptureStats, issues: Vec<CaptureIssue>) -> Self {
         Self {
             root_tree_id,
@@ -151,6 +159,7 @@ pub struct CaptureIssue {
 
 impl CaptureIssue {
     /// Creates a capture issue.
+    #[must_use]
     pub fn new(path: PathBuf, kind: CaptureIssueKind) -> Self {
         Self { path, kind }
     }

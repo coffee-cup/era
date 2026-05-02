@@ -22,16 +22,19 @@ pub struct FilesystemMaterializer {
 
 impl FilesystemMaterializer {
     /// Creates a materializer with default capture options.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Creates a materializer with explicit capture options.
+    #[must_use]
     pub fn with_options(options: CaptureOptions) -> Self {
         Self { options }
     }
 
     /// Returns this materializer's capture options.
+    #[must_use]
     pub fn options(&self) -> &CaptureOptions {
         &self.options
     }

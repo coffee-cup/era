@@ -86,16 +86,19 @@ impl Repository {
     }
 
     /// Returns the working-directory root path.
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// Returns the `.era` metadata directory path.
+    #[must_use]
     pub fn metadata_dir(&self) -> &Path {
         &self.metadata_dir
     }
 
     /// Returns the local object store for this repository.
+    #[must_use]
     pub fn object_store(&self) -> &LocalObjectStore {
         &self.object_store
     }
@@ -165,6 +168,7 @@ impl Repository {
     }
 
     /// Returns the path used for the HEAD file.
+    #[must_use]
     pub fn head_path(&self) -> PathBuf {
         head_path(&self.metadata_dir)
     }
@@ -209,6 +213,7 @@ pub struct SnapshotRequest {
 
 impl SnapshotRequest {
     /// Creates request metadata for a repository initialization snapshot.
+    #[must_use]
     pub fn initial() -> Self {
         Self {
             timestamp_millis: None,
@@ -219,6 +224,7 @@ impl SnapshotRequest {
     }
 
     /// Creates request metadata for a manually requested snapshot.
+    #[must_use]
     pub fn manual(message: impl Into<String>) -> Self {
         Self {
             timestamp_millis: None,
@@ -229,18 +235,21 @@ impl SnapshotRequest {
     }
 
     /// Sets a deterministic timestamp in milliseconds since the Unix epoch.
+    #[must_use]
     pub fn with_timestamp_millis(mut self, timestamp_millis: u64) -> Self {
         self.timestamp_millis = Some(timestamp_millis);
         self
     }
 
     /// Sets the snapshot author.
+    #[must_use]
     pub fn with_author(mut self, author: impl Into<String>) -> Self {
         self.author = Some(author.into());
         self
     }
 
     /// Sets structured provenance for the snapshot.
+    #[must_use]
     pub fn with_provenance(mut self, provenance: SnapshotProvenance) -> Self {
         self.provenance = provenance;
         self
@@ -249,10 +258,13 @@ impl SnapshotRequest {
     fn resolve_timestamp(&self) -> Result<u64, RepositoryError> {
         match self.timestamp_millis {
             Some(timestamp_millis) => Ok(timestamp_millis),
-            None => Ok(SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|source| RepositoryError::ClockBeforeUnixEpoch { source })?
-                .as_millis() as u64),
+            None => {
+                let millis = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|source| RepositoryError::ClockBeforeUnixEpoch { source })?
+                    .as_millis();
+                u64::try_from(millis).map_err(|_| RepositoryError::TimestampOverflow { millis })
+            }
         }
     }
 }

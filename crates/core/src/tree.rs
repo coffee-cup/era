@@ -65,16 +65,19 @@ impl TreeEntry {
     }
 
     /// Returns the entry name.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns the entry kind.
+    #[must_use]
     pub fn kind(&self) -> EntryKind {
         self.kind
     }
 
     /// Returns the object ID the entry points at.
+    #[must_use]
     pub fn id(&self) -> ObjectId {
         self.id
     }
@@ -97,6 +100,7 @@ impl Tree {
     }
 
     /// Creates an empty tree.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
@@ -104,11 +108,13 @@ impl Tree {
     }
 
     /// Returns sorted tree entries.
+    #[must_use]
     pub fn entries(&self) -> &[TreeEntry] {
         &self.entries
     }
 
     /// Returns canonical serialized tree bytes.
+    #[must_use]
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut output = Vec::new();
         output.extend_from_slice(TREE_MAGIC);
@@ -182,6 +188,7 @@ impl Tree {
     }
 
     /// Returns the content-addressed ID of this tree's canonical bytes.
+    #[must_use]
     pub fn id(&self) -> ObjectId {
         ObjectId::from_content(self.to_canonical_bytes())
     }

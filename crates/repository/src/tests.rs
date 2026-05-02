@@ -10,6 +10,9 @@ fn branch_name_exposes_inner_value() {
     let branch = BranchName::new("main").unwrap();
 
     assert_eq!(branch.as_str(), "main");
+    assert_eq!(branch.to_string(), "main");
+    assert_eq!(branch.as_ref(), "main");
+    assert_eq!("main".parse::<BranchName>().unwrap(), branch);
 }
 
 #[test]

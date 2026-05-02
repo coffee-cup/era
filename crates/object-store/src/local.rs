@@ -41,6 +41,7 @@ impl LocalObjectStore {
     }
 
     /// Returns the object store root directory.
+    #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -120,6 +121,7 @@ impl LocalObjectStore {
     }
 
     /// Returns the local path used to store an object.
+    #[must_use]
     pub fn object_path(&self, kind: ObjectKind, id: &ObjectId) -> PathBuf {
         let hex = id.to_string();
         object_dir(&self.root, kind)
@@ -128,16 +130,19 @@ impl LocalObjectStore {
     }
 
     /// Returns the local path used to store a blob.
+    #[must_use]
     pub fn blob_path(&self, id: &ObjectId) -> PathBuf {
         self.object_path(ObjectKind::Blob, id)
     }
 
     /// Returns the local path used to store a tree.
+    #[must_use]
     pub fn tree_path(&self, id: &ObjectId) -> PathBuf {
         self.object_path(ObjectKind::Tree, id)
     }
 
     /// Returns the local path used to store a snapshot.
+    #[must_use]
     pub fn snapshot_path(&self, id: &ObjectId) -> PathBuf {
         self.object_path(ObjectKind::Snapshot, id)
     }

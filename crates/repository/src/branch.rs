@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, str::FromStr};
 
 /// A named mutable pointer to a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -13,13 +13,35 @@ impl BranchName {
     }
 
     /// Returns the default branch name.
+    #[must_use]
     pub fn main() -> Self {
         Self("main".to_owned())
     }
 
     /// Returns the branch name.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl AsRef<str> for BranchName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for BranchName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for BranchName {
+    type Err = InvalidBranchName;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
     }
 }
 
@@ -36,11 +58,13 @@ impl InvalidBranchName {
     }
 
     /// Returns the invalid branch name.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Returns why the branch name is invalid.
+    #[must_use]
     pub fn reason(&self) -> InvalidBranchNameReason {
         self.reason
     }

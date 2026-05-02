@@ -12,6 +12,7 @@ pub struct SnapshotProvenance {
 
 impl SnapshotProvenance {
     /// Creates provenance with a source name and no extra attributes.
+    #[must_use]
     pub fn new(source: impl Into<String>) -> Self {
         Self {
             source: source.into(),
@@ -20,26 +21,31 @@ impl SnapshotProvenance {
     }
 
     /// Provenance for repository initialization snapshots.
+    #[must_use]
     pub fn initial() -> Self {
         Self::new("repository-init")
     }
 
     /// Provenance for explicitly requested manual snapshots.
+    #[must_use]
     pub fn manual() -> Self {
         Self::new("manual-snapshot")
     }
 
     /// Returns the source that produced the snapshot.
+    #[must_use]
     pub fn source(&self) -> &str {
         &self.source
     }
 
     /// Returns sorted provenance attributes.
+    #[must_use]
     pub fn attributes(&self) -> &BTreeMap<String, String> {
         &self.attributes
     }
 
     /// Adds or replaces a provenance attribute.
+    #[must_use]
     pub fn with_attribute(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.attributes.insert(key.into(), value.into());
         self
@@ -59,6 +65,7 @@ pub struct Snapshot {
 
 impl Snapshot {
     /// Creates a snapshot value.
+    #[must_use]
     pub fn new(
         root_tree_id: ObjectId,
         parents: impl Into<Vec<ObjectId>>,
@@ -78,36 +85,43 @@ impl Snapshot {
     }
 
     /// Returns the root tree captured by this snapshot.
+    #[must_use]
     pub fn root_tree_id(&self) -> ObjectId {
         self.root_tree_id
     }
 
     /// Returns the parent snapshot IDs in stored order.
+    #[must_use]
     pub fn parents(&self) -> &[ObjectId] {
         &self.parents
     }
 
     /// Returns the snapshot timestamp as milliseconds since the Unix epoch.
+    #[must_use]
     pub fn timestamp_millis(&self) -> u64 {
         self.timestamp_millis
     }
 
     /// Returns the optional snapshot author.
+    #[must_use]
     pub fn author(&self) -> Option<&str> {
         self.author.as_deref()
     }
 
     /// Returns the optional human-facing snapshot message.
+    #[must_use]
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
     }
 
     /// Returns structured provenance for the snapshot.
+    #[must_use]
     pub fn provenance(&self) -> &SnapshotProvenance {
         &self.provenance
     }
 
     /// Returns canonical serialized snapshot bytes.
+    #[must_use]
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut output = Vec::new();
         output.extend_from_slice(SNAPSHOT_MAGIC);
@@ -187,6 +201,7 @@ impl Snapshot {
     }
 
     /// Returns the content-addressed ID of this snapshot's canonical bytes.
+    #[must_use]
     pub fn id(&self) -> ObjectId {
         ObjectId::from_content(self.to_canonical_bytes())
     }

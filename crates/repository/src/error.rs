@@ -31,6 +31,8 @@ pub enum RepositoryError {
     SnapshotCycle { id: ObjectId },
     /// The system clock was before the Unix epoch.
     ClockBeforeUnixEpoch { source: SystemTimeError },
+    /// The current timestamp did not fit Era's snapshot timestamp field.
+    TimestampOverflow { millis: u128 },
     /// A repository metadata filesystem operation failed.
     Io { path: PathBuf, source: io::Error },
     /// The object store failed while reading or writing repository objects.
@@ -92,6 +94,10 @@ impl fmt::Display for RepositoryError {
             Self::ClockBeforeUnixEpoch { source } => {
                 write!(formatter, "system clock is before the Unix epoch: {source}")
             }
+            Self::TimestampOverflow { millis } => write!(
+                formatter,
+                "snapshot timestamp {millis}ms since the Unix epoch does not fit in u64"
+            ),
             Self::Io { path, source } => write!(
                 formatter,
                 "repository filesystem error at {}: {source}",
@@ -122,7 +128,8 @@ impl Error for RepositoryError {
             | Self::InvalidHead { .. }
             | Self::RefMissing { .. }
             | Self::InvalidRef { .. }
-            | Self::SnapshotCycle { .. } => None,
+            | Self::SnapshotCycle { .. }
+            | Self::TimestampOverflow { .. } => None,
         }
     }
 }

@@ -15,11 +15,13 @@ pub struct ObjectId([u8; OBJECT_ID_BYTES]);
 
 impl ObjectId {
     /// Creates an object identifier from raw hash bytes.
+    #[must_use]
     pub fn from_bytes(bytes: [u8; OBJECT_ID_BYTES]) -> Self {
         Self(bytes)
     }
 
     /// Hashes content with BLAKE3 and returns its object identifier.
+    #[must_use]
     pub fn from_content(content: impl AsRef<[u8]>) -> Self {
         let hash = blake3::hash(content.as_ref());
         Self(*hash.as_bytes())
@@ -31,11 +33,13 @@ impl ObjectId {
     }
 
     /// Returns the raw hash bytes.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8; OBJECT_ID_BYTES] {
         &self.0
     }
 
     /// Returns the canonical lowercase hexadecimal representation.
+    #[must_use]
     pub fn to_hex(self) -> String {
         let mut output = String::with_capacity(OBJECT_ID_HEX_LENGTH);
         for byte in self.0 {
@@ -49,6 +53,7 @@ impl ObjectId {
     ///
     /// Local stores use this as a simple shard prefix to avoid putting every
     /// object in a single directory.
+    #[must_use]
     pub fn shard_prefix(self) -> String {
         let byte = self.0[0];
         let mut output = String::with_capacity(2);
