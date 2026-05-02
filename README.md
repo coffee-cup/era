@@ -15,7 +15,7 @@ The v0 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.
 
 ## Current status
 
-The first implemented component is the content-addressed blob layer: BLAKE3 object IDs in `era-core` and an async local blob store in `era-object-store`. Higher-level trees, snapshots, repository metadata, and CLI workflows are tracked in [`docs/PLAN.md`](docs/PLAN.md).
+The implemented foundation is the content-addressed object layer: BLAKE3 object IDs and deterministic tree types in `era-core`, plus an async local blob/tree store in `era-object-store`. Higher-level materialization, snapshots, repository metadata, and CLI workflows are tracked in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Prerequisites
 

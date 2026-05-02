@@ -41,6 +41,8 @@ The bytes of a single file, addressed by a hash of its contents. Identical bytes
 
 A directory listing — an ordered set of named entries, each pointing to either another tree or a blob. A tree is itself addressed by a hash of its serialized contents. Two directories with identical contents share storage; a directory whose contents have not changed since the previous snapshot is the same tree object as before.
 
+In the current implementation, tree entries use UTF-8 single-segment names. Emoji and non-English characters are supported and preserved exactly; Unicode normalization is not applied. Empty names, `.`, `..`, names containing `/`, and names containing NUL are invalid.
+
 This is the copy-on-write magic: changing a single file in a deeply nested directory rewrites only that file's blob, the tree containing it, and the trees on the path back to the root. Everything else is shared with the prior state.
 
 ### Snapshot
@@ -96,7 +98,7 @@ Responsibilities:
 
 The object store has no notion of "current state" or "working directory." It is a key-value store where keys are content hashes and values are the immutable bytes of objects. The same object store can back any number of repositories or working directories.
 
-The first implemented slice is intentionally smaller than the full object-store role: an async blob-store interface plus a local filesystem-backed implementation. It uses BLAKE3 object IDs, stores blobs under a sharded `blobs/<prefix>/<object-id>` directory layout, deduplicates identical bytes, and verifies hashes on read so corruption is surfaced immediately. Tree and snapshot storage will build on the same content-addressed primitive.
+The first implemented slices cover an async object-store interface plus a local filesystem-backed implementation for blobs and trees. It uses BLAKE3 object IDs, stores objects under sharded `<kind>/<prefix>/<object-id>` directories, deduplicates identical bytes, and verifies hashes on read so corruption is surfaced immediately. Tree objects are stored as deterministic canonical bytes and decoded with canonical-order validation. Snapshot storage will build on the same content-addressed primitive.
 
 ### Materialization
 
