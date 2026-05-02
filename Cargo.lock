@@ -143,6 +143,14 @@ dependencies = [
 [[package]]
 name = "era-repository"
 version = "0.1.0"
+dependencies = [
+ "era-core",
+ "era-materialization",
+ "era-object-store",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "errno"

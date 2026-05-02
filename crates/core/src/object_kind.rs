@@ -7,6 +7,8 @@ pub enum ObjectKind {
     Blob,
     /// Canonical serialized directory listing.
     Tree,
+    /// Canonical serialized captured tree state with history metadata.
+    Snapshot,
 }
 
 impl fmt::Display for ObjectKind {
@@ -14,6 +16,7 @@ impl fmt::Display for ObjectKind {
         match self {
             Self::Blob => formatter.write_str("blob"),
             Self::Tree => formatter.write_str("tree"),
+            Self::Snapshot => formatter.write_str("snapshot"),
         }
     }
 }

@@ -1,6 +1,9 @@
 use crate::local::object_dir;
 use crate::{LocalObjectStore, ObjectStore, ObjectStoreError};
-use era_core::{EntryKind, ObjectId, ObjectKind, Tree, TreeEntry, TreeError};
+use era_core::{
+    EntryKind, ObjectId, ObjectKind, Snapshot, SnapshotError, SnapshotProvenance, Tree, TreeEntry,
+    TreeError,
+};
 use std::{io, path::Path};
 use tempfile::TempDir;
 use tokio::fs;
@@ -18,6 +21,7 @@ async fn open_creates_store_directories() {
     assert_eq!(store.root(), root);
     assert!(fs::metadata(root.join("blobs")).await.unwrap().is_dir());
     assert!(fs::metadata(root.join("trees")).await.unwrap().is_dir());
+    assert!(fs::metadata(root.join("snapshots")).await.unwrap().is_dir());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -302,21 +306,151 @@ async fn tree_path_is_sharded_by_first_hex_byte() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn object_store_trait_object_round_trips_blob_and_tree() {
+async fn put_snapshot_round_trips_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let snapshot = sample_snapshot();
+
+    let id = store.put_snapshot(&snapshot).await.unwrap();
+
+    assert_eq!(id, snapshot.id());
+    assert_eq!(store.get_snapshot(&id).await.unwrap(), snapshot);
+    assert!(store.contains(ObjectKind::Snapshot, &id).await.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn identical_snapshots_share_an_object_file() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let snapshot = sample_snapshot();
+
+    let first = store.put_snapshot(&snapshot).await.unwrap();
+    let second = store.put_snapshot(&snapshot).await.unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(
+        object_file_count(store.root(), ObjectKind::Snapshot).await,
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_snapshot_returns_clear_error() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let id = sample_snapshot().id();
+
+    let error = store.get_snapshot(&id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ObjectStoreError::MissingObject {
+            kind: ObjectKind::Snapshot,
+            id: found,
+            ..
+        } if found == id
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn corrupted_snapshot_fails_integrity_check() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let snapshot = sample_snapshot();
+    let id = store.put_snapshot(&snapshot).await.unwrap();
+    fs::write(store.snapshot_path(&id), b"corrupt")
+        .await
+        .unwrap();
+
+    let error = store.get_snapshot(&id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ObjectStoreError::HashMismatch {
+            kind: ObjectKind::Snapshot,
+            expected,
+            actual,
+            ..
+        } if expected == id && actual == ObjectId::from_content(b"corrupt")
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn non_canonical_snapshot_object_is_rejected() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let bytes = encode_snapshot_attrs_unchecked(&[("z", "last"), ("a", "first")]);
+    let id = ObjectId::from_content(&bytes);
+    let path = store.snapshot_path(&id);
+    fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+    fs::write(&path, bytes).await.unwrap();
+
+    let error = store.get_snapshot(&id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ObjectStoreError::InvalidSnapshotObject {
+            id: found,
+            source: SnapshotError::NonCanonicalProvenanceAttributeOrder { .. },
+            ..
+        } if found == id
+    ));
+    assert!(matches!(
+        store.contains(ObjectKind::Snapshot, &id).await.unwrap_err(),
+        ObjectStoreError::InvalidSnapshotObject { .. }
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_path_is_sharded_by_first_hex_byte() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let id = sample_snapshot().id();
+    let hex = id.to_string();
+
+    assert_eq!(
+        store.snapshot_path(&id),
+        store.root().join("snapshots").join(&hex[..2]).join(hex)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn object_store_trait_object_round_trips_all_object_kinds() {
     let temp = TempDir::new().unwrap();
     let store = LocalObjectStore::open(temp.path().join("objects"))
         .await
         .unwrap();
     let store: &dyn ObjectStore = &store;
     let tree = sample_tree();
+    let snapshot = sample_snapshot();
 
     let blob_id = store.put_blob(b"via trait").await.unwrap();
     let tree_id = store.put_tree(&tree).await.unwrap();
+    let snapshot_id = store.put_snapshot(&snapshot).await.unwrap();
 
     assert_eq!(store.get_blob(&blob_id).await.unwrap(), b"via trait");
     assert_eq!(store.get_tree(&tree_id).await.unwrap(), tree);
+    assert_eq!(store.get_snapshot(&snapshot_id).await.unwrap(), snapshot);
     assert!(store.contains(ObjectKind::Blob, &blob_id).await.unwrap());
     assert!(store.contains(ObjectKind::Tree, &tree_id).await.unwrap());
+    assert!(
+        store
+            .contains(ObjectKind::Snapshot, &snapshot_id)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -421,6 +555,36 @@ async fn concurrent_puts_of_same_tree_dedupe_and_cleanup_temps() {
     assert_eq!(temp_file_count(store.root(), ObjectKind::Tree).await, 0);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_puts_of_same_snapshot_dedupe_and_cleanup_temps() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let snapshot = sample_snapshot();
+    let expected = snapshot.id();
+
+    let mut handles = Vec::new();
+    for _ in 0..64 {
+        let store = store.clone();
+        let snapshot = snapshot.clone();
+        handles.push(tokio::spawn(async move {
+            store.put_snapshot(&snapshot).await.unwrap()
+        }));
+    }
+
+    for handle in handles {
+        assert_eq!(handle.await.unwrap(), expected);
+    }
+
+    assert_eq!(store.get_snapshot(&expected).await.unwrap(), snapshot);
+    assert_eq!(
+        object_file_count(store.root(), ObjectKind::Snapshot).await,
+        1
+    );
+    assert_eq!(temp_file_count(store.root(), ObjectKind::Snapshot).await, 0);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn open_fails_when_root_path_is_file() {
     let temp = TempDir::new().unwrap();
@@ -484,6 +648,29 @@ async fn open_fails_when_trees_path_is_file() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn open_fails_when_snapshots_path_is_file() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("objects");
+    fs::create_dir(&root).await.unwrap();
+    fs::create_dir(root.join("blobs")).await.unwrap();
+    fs::create_dir(root.join("trees")).await.unwrap();
+    let snapshots = root.join("snapshots");
+    fs::write(&snapshots, b"not a directory").await.unwrap();
+
+    let error = LocalObjectStore::open(&root).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ObjectStoreError::Io { path, source }
+            if path == snapshots
+                && matches!(
+                    source.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+                )
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn put_blob_fails_when_shard_path_is_file() {
     let temp = TempDir::new().unwrap();
     let store = LocalObjectStore::open(temp.path().join("objects"))
@@ -517,6 +704,29 @@ async fn put_tree_fails_when_shard_path_is_file() {
     fs::write(&shard_path, b"not a directory").await.unwrap();
 
     let error = store.put_tree(&tree).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ObjectStoreError::Io { source, .. }
+            if matches!(
+                source.kind(),
+                io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+            )
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn put_snapshot_fails_when_shard_path_is_file() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let snapshot = sample_snapshot();
+    let id = snapshot.id();
+    let shard_path = store.root().join("snapshots").join(id.shard_prefix());
+    fs::write(&shard_path, b"not a directory").await.unwrap();
+
+    let error = store.put_snapshot(&snapshot).await.unwrap_err();
 
     assert!(matches!(
         error,
@@ -609,6 +819,17 @@ fn sample_tree() -> Tree {
     .unwrap()
 }
 
+fn sample_snapshot() -> Snapshot {
+    Snapshot::new(
+        sample_tree().id(),
+        vec![ObjectId::from_content(b"parent")],
+        1_700_000_000_123,
+        Some("agent@example".to_owned()),
+        Some("checkpoint".to_owned()),
+        SnapshotProvenance::manual().with_attribute("model", "test-model"),
+    )
+}
+
 fn encode_tree_entries_unchecked(entries: &[(EntryKind, &str, ObjectId)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(b"ERA_TREE_V1\0");
@@ -623,6 +844,28 @@ fn encode_tree_entries_unchecked(entries: &[(EntryKind, &str, ObjectId)]) -> Vec
         bytes.extend_from_slice(id.as_bytes());
     }
     bytes
+}
+
+fn encode_snapshot_attrs_unchecked(attrs: &[(&str, &str)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"ERA_SNAPSHOT_V1\0");
+    bytes.extend_from_slice(sample_tree().id().as_bytes());
+    bytes.extend_from_slice(&0_u32.to_be_bytes());
+    bytes.extend_from_slice(&1_u64.to_be_bytes());
+    bytes.push(0);
+    bytes.push(0);
+    encode_string(&mut bytes, "manual-snapshot");
+    bytes.extend_from_slice(&(attrs.len() as u32).to_be_bytes());
+    for (key, value) in attrs {
+        encode_string(&mut bytes, key);
+        encode_string(&mut bytes, value);
+    }
+    bytes
+}
+
+fn encode_string(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
 }
 
 async fn object_file_count(root: &Path, kind: ObjectKind) -> usize {

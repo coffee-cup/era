@@ -1,4 +1,4 @@
-use era_core::{ObjectId, ObjectKind, TreeError};
+use era_core::{ObjectId, ObjectKind, SnapshotError, TreeError};
 use std::{error::Error, fmt, io, path::PathBuf};
 
 /// Errors returned by object store implementations.
@@ -24,6 +24,12 @@ pub enum ObjectStoreError {
         id: ObjectId,
         path: PathBuf,
         source: TreeError,
+    },
+    /// A snapshot object was hash-valid, but did not decode as canonical snapshot bytes.
+    InvalidSnapshotObject {
+        id: ObjectId,
+        path: PathBuf,
+        source: SnapshotError,
     },
     /// The store could not allocate a collision-free temporary path.
     TempFileExhausted {
@@ -63,6 +69,11 @@ impl fmt::Display for ObjectStoreError {
                 "tree object {id} at {} is not canonical: {source}",
                 path.display()
             ),
+            Self::InvalidSnapshotObject { id, path, source } => write!(
+                formatter,
+                "snapshot object {id} at {} is not canonical: {source}",
+                path.display()
+            ),
             Self::TempFileExhausted {
                 kind,
                 directory,
@@ -81,6 +92,7 @@ impl Error for ObjectStoreError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::InvalidTreeObject { source, .. } => Some(source),
+            Self::InvalidSnapshotObject { source, .. } => Some(source),
             Self::MissingObject { .. }
             | Self::HashMismatch { .. }
             | Self::TempFileExhausted { .. } => None,

@@ -47,9 +47,9 @@ This is the copy-on-write magic: changing a single file in a deeply nested direc
 
 ### Snapshot
 
-A complete record of the entire tree at a moment in time. A snapshot points to the root tree, references its parent snapshot(s), and carries structured metadata: timestamp, author, optional human-readable label, and provenance (what tool or agent produced it, what action it corresponded to).
+A complete record of the entire tree at a moment in time. A snapshot points to the root tree, references its parent snapshot(s), and carries structured metadata: timestamp, author, optional human-readable message, and provenance (what tool or agent produced it, what action it corresponded to).
 
-Snapshots form a directed acyclic graph via their parent pointers. A linear sequence of snapshots looks like git's commit history. Merges produce snapshots with multiple parents. Branches are simply named pointers into the graph.
+In the current implementation, snapshots have deterministic canonical bytes and content-addressed IDs. Small golden fixtures lock the v1 snapshot encoding for compatibility. Snapshots form a directed acyclic graph via their parent pointers. A linear sequence of snapshots looks like git's commit history. Merges produce snapshots with multiple parents. Branches are simply named pointers into the graph.
 
 There is no distinction between "auto-snapshots" and "commits" in the storage layer — they are the same object. The difference is only whether a human-readable label was attached. Tooling treats labeled snapshots as the meaningful waypoints and unlabeled ones as the dense history between them.
 
@@ -98,7 +98,7 @@ Responsibilities:
 
 The object store has no notion of "current state" or "working directory." It is a key-value store where keys are content hashes and values are the immutable bytes of objects. The same object store can back any number of repositories or working directories.
 
-The first implemented slices cover an async object-store interface plus a local filesystem-backed implementation for blobs and trees. It uses BLAKE3 object IDs, stores objects under sharded `<kind>/<prefix>/<object-id>` directories, deduplicates identical bytes, and verifies hashes on read so corruption is surfaced immediately. Tree objects are stored as deterministic canonical bytes and decoded with canonical-order validation. Snapshot storage will build on the same content-addressed primitive.
+The implemented object-store slices cover an async object-store interface plus a local filesystem-backed implementation for blobs, trees, and snapshots. It uses BLAKE3 object IDs, stores objects under sharded `<kind>/<prefix>/<object-id>` directories, deduplicates identical bytes, and verifies hashes on read so corruption is surfaced immediately. Tree and snapshot objects are stored as deterministic canonical bytes and decoded with canonical-order validation. Local repositories place this store under `.era/objects`.
 
 ### Materialization
 
@@ -126,6 +126,8 @@ Responsibilities:
 - Drive the auto-snapshot loop: receive change events from the materializer, decide when to capture a snapshot, write it through the object store
 - Implement higher-level operations: diff between snapshots, walk history, merge branches
 - Apply tracking heuristics: decide which files should and should not be part of snapshots
+
+The current repository implementation covers local init, open, manual snapshots, and first-parent timeline walking. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Manual snapshots capture the current tree, store a snapshot with the current branch tip as parent, and advance the branch ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
 
 The repository is where intelligence lives. It is also where most of the v0 design space is, because the rules for "when do we snapshot, what do we include, how do we merge" are precisely what differentiates this system from git.
 
@@ -301,9 +303,9 @@ To make the layers concrete, here is what happens when a file changes:
 1. **An editor (or agent) writes to a file** in the working directory.
 2. **The materialization layer's watcher** observes the write and emits a change event.
 3. **The repository layer** debounces a series of such events and decides a snapshot is warranted.
-4. **The repository asks the materializer** to compute the current tree state. The materializer walks the working directory, using the hash cache to skip unchanged files.
+4. **The repository asks the materializer** to compute the current tree state. The materializer walks the working directory, using the hash cache to skip unchanged files once that cache exists.
 5. **For any file whose hash is new**, the materializer hands the bytes to the object store, which stores them and returns a hash. (Most files are unchanged and produce no new objects.)
-6. **The repository builds tree objects** from the bottom up, again writing only new trees to the object store. Most trees are reused from the previous snapshot.
+6. **The materializer builds tree objects** from the bottom up, again writing only new trees to the object store. Most trees are reused from the previous snapshot.
 7. **The repository builds a snapshot object** referencing the new root tree, the previous snapshot as its parent, the current timestamp, and any provenance supplied by the agent or user.
 8. **The repository updates the current branch's reference** to point at the new snapshot.
 

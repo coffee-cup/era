@@ -1,6 +1,6 @@
 use crate::{ObjectStore, ObjectStoreError};
 use async_trait::async_trait;
-use era_core::{ObjectId, ObjectKind, Tree};
+use era_core::{ObjectId, ObjectKind, Snapshot, Tree};
 use std::{
     io,
     path::{Path, PathBuf},
@@ -26,7 +26,7 @@ impl LocalObjectStore {
         let root = root.into();
         debug!(root = %root.display(), "opening local object store");
 
-        for kind in [ObjectKind::Blob, ObjectKind::Tree] {
+        for kind in [ObjectKind::Blob, ObjectKind::Tree, ObjectKind::Snapshot] {
             let directory = object_dir(&root, kind);
             fs::create_dir_all(&directory)
                 .await
@@ -78,6 +78,26 @@ impl LocalObjectStore {
         })
     }
 
+    /// Stores a snapshot and returns the ID of its canonical serialized bytes.
+    pub async fn put_snapshot(&self, snapshot: &Snapshot) -> Result<ObjectId, ObjectStoreError> {
+        let bytes = snapshot.to_canonical_bytes();
+        let id = ObjectId::from_content(&bytes);
+        self.put_object(ObjectKind::Snapshot, id, &bytes).await
+    }
+
+    /// Reads a snapshot by object ID and verifies its integrity and canonical form.
+    pub async fn get_snapshot(&self, id: &ObjectId) -> Result<Snapshot, ObjectStoreError> {
+        let path = self.object_path(ObjectKind::Snapshot, id);
+        let bytes = self.get_object_bytes(ObjectKind::Snapshot, id).await?;
+        Snapshot::from_canonical_bytes(&bytes).map_err(|source| {
+            ObjectStoreError::InvalidSnapshotObject {
+                id: *id,
+                path,
+                source,
+            }
+        })
+    }
+
     /// Returns `true` when a valid object exists in the store.
     pub async fn contains(
         &self,
@@ -87,6 +107,11 @@ impl LocalObjectStore {
         match kind {
             ObjectKind::Blob => self.contains_object_hash(kind, id).await,
             ObjectKind::Tree => match self.get_tree(id).await {
+                Ok(_) => Ok(true),
+                Err(ObjectStoreError::MissingObject { .. }) => Ok(false),
+                Err(error) => Err(error),
+            },
+            ObjectKind::Snapshot => match self.get_snapshot(id).await {
                 Ok(_) => Ok(true),
                 Err(ObjectStoreError::MissingObject { .. }) => Ok(false),
                 Err(error) => Err(error),
@@ -110,6 +135,11 @@ impl LocalObjectStore {
     /// Returns the local path used to store a tree.
     pub fn tree_path(&self, id: &ObjectId) -> PathBuf {
         self.object_path(ObjectKind::Tree, id)
+    }
+
+    /// Returns the local path used to store a snapshot.
+    pub fn snapshot_path(&self, id: &ObjectId) -> PathBuf {
+        self.object_path(ObjectKind::Snapshot, id)
     }
 
     async fn put_object(
@@ -295,6 +325,14 @@ impl ObjectStore for LocalObjectStore {
         LocalObjectStore::get_tree(self, id).await
     }
 
+    async fn put_snapshot(&self, snapshot: &Snapshot) -> Result<ObjectId, ObjectStoreError> {
+        LocalObjectStore::put_snapshot(self, snapshot).await
+    }
+
+    async fn get_snapshot(&self, id: &ObjectId) -> Result<Snapshot, ObjectStoreError> {
+        LocalObjectStore::get_snapshot(self, id).await
+    }
+
     async fn contains(&self, kind: ObjectKind, id: &ObjectId) -> Result<bool, ObjectStoreError> {
         LocalObjectStore::contains(self, kind, id).await
     }
@@ -333,5 +371,6 @@ pub(crate) fn object_dir(root: &Path, kind: ObjectKind) -> PathBuf {
     root.join(match kind {
         ObjectKind::Blob => "blobs",
         ObjectKind::Tree => "trees",
+        ObjectKind::Snapshot => "snapshots",
     })
 }

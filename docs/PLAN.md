@@ -23,18 +23,20 @@ Status: implemented.
   - `era-materialization`
   - `era-repository`
   - `era-cli` with binary name `era`
-- `era-core` owns BLAKE3-based `ObjectId` parsing, formatting, validation, content hashing, and deterministic tree domain types.
+- `era-core` owns BLAKE3-based `ObjectId` parsing, formatting, validation, content hashing, and deterministic tree/snapshot domain types.
 - Tree entries use UTF-8 single path-segment names, support emoji and non-English characters, preserve exact bytes, and intentionally do not normalize Unicode.
 - `era-object-store` owns one async `ObjectStore` trait plus a local content-addressed implementation:
   - `put_blob(bytes) -> ObjectId`
   - `get_blob(id) -> bytes`
   - `put_tree(tree) -> ObjectId`
   - `get_tree(id) -> Tree`
+  - `put_snapshot(snapshot) -> ObjectId`
+  - `get_snapshot(id) -> Snapshot`
   - `contains(kind, id) -> bool`
   - deduplication for identical content
   - sharded filesystem layout
   - integrity verification on reads
-  - canonical tree validation
+  - canonical tree and snapshot validation
   - corruption detection instead of silent overwrite
 
 ### Materialization scan
@@ -50,21 +52,23 @@ Status: implemented.
 
 Important boundary rule: filesystem calls belong inside storage/materialization implementations. Repository and CLI code should depend on async capabilities, not direct `std::fs` access to the working tree. Instrument I/O-heavy paths with `tracing` spans/events so agents can debug behavior and performance without adding ad-hoc prints.
 
+### Repository init and manual snapshot
+
+Status: implemented.
+
+- `era-repository` creates and opens local repositories rooted at a working directory.
+- Repository metadata uses:
+  - `.era/HEAD`
+  - `.era/refs/heads/main`
+  - `.era/objects/{blobs,trees,snapshots}`
+- Init captures the working directory, writes an initial snapshot with structured provenance, and points `main` at it.
+- Manual snapshots capture the current working directory, store a snapshot with the current branch tip as parent, and advance the branch ref.
+- Timelines walk first-parent history from the current branch newest-to-oldest.
+- Snapshot canonical bytes are locked with small golden fixtures under `crates/core/tests/fixtures/`.
+
 ## Next slices
 
-### 1. Repository init and manual snapshot
-
-Teach `era-repository` to create repository metadata and capture explicit snapshots.
-
-Focus:
-
-- `.era/` layout.
-- `HEAD` and `refs/heads/main`.
-- snapshot objects with parent pointers and provenance.
-- initial snapshot and subsequent manual snapshots.
-- timeline walking from the current branch.
-
-### 2. Thin CLI
+### 1. Thin CLI
 
 Expose only the workflows needed to play with the system.
 
@@ -85,7 +89,7 @@ era switch NAME
 era restore SNAPSHOT_OR_LABEL
 ```
 
-### 3. Agent-facing eval flows
+### 2. Agent-facing eval flows
 
 Add markdown evals/scripts that another Pi agent can run against a temp project.
 
