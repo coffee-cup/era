@@ -6,12 +6,16 @@ The v0 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.
 
 ## Workspace layout
 
-- `crates/core` — shared domain types and primitives.
-- `crates/object-store` — content-addressed storage abstractions and implementations.
-- `crates/materialization` — working-directory materialization and filesystem observation.
-- `crates/repository` — branch, snapshot, history, and policy orchestration.
-- `crates/cli` — command-line interface over the library APIs.
+- `crates/core` (`era-core`) — shared domain types and primitives.
+- `crates/object-store` (`era-object-store`) — content-addressed storage abstractions and implementations.
+- `crates/materialization` (`era-materialization`) — working-directory materialization and filesystem observation.
+- `crates/repository` (`era-repository`) — branch, snapshot, history, and policy orchestration.
+- `crates/cli` (`era-cli`, binary `era`) — command-line interface over the library APIs.
 - `docs/` — architecture and design documentation.
+
+## Current status
+
+The first implemented component is the content-addressed blob layer: BLAKE3 object IDs in `era-core` and an async local blob store in `era-object-store`. Higher-level trees, snapshots, repository metadata, and CLI workflows are tracked in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Prerequisites
 

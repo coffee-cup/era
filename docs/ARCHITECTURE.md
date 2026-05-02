@@ -96,6 +96,8 @@ Responsibilities:
 
 The object store has no notion of "current state" or "working directory." It is a key-value store where keys are content hashes and values are the immutable bytes of objects. The same object store can back any number of repositories or working directories.
 
+The first implemented slice is intentionally smaller than the full object-store role: an async blob-store interface plus a local filesystem-backed implementation. It uses BLAKE3 object IDs, stores blobs under a sharded `blobs/<prefix>/<object-id>` directory layout, deduplicates identical bytes, and verifies hashes on read so corruption is surfaced immediately. Tree and snapshot storage will build on the same content-addressed primitive.
+
 ### Materialization
 
 The seam between the abstract world of snapshots and the concrete world of files on disk. This layer translates between "snapshot X should be visible at path P" and the actual file operations that make it so.
@@ -106,7 +108,7 @@ Responsibilities:
 - Observe a working directory and report how it differs from a known snapshot
 - Watch for changes in the working directory and notify higher layers
 
-In v0, materialization works by ordinary file operations — copying bytes from the object store onto the filesystem, walking the working tree to detect changes, and using a platform-appropriate filesystem watcher to observe writes.
+In v0, materialization works by ordinary file operations — copying bytes from the object store onto the filesystem, walking the working tree to detect changes, and using a platform-appropriate filesystem watcher to observe writes. The materialization API should still be async and capability-oriented from the start, so repository code does not depend on the copy-based implementation detail.
 
 This layer is intentionally a replaceable component. Future implementations (hardlink-based, reflink-based, FUSE-based) will plug in here without changing anything above. The interface this layer presents to the repository is small and stable: "checkout this snapshot at this path," "what does this path look like now," "tell me when something changes."
 
