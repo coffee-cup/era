@@ -1,0 +1,27 @@
+[tools]
+rust = "stable"
+
+[tasks.fmt]
+description = "Format all Rust crates"
+run = "cargo fmt --all"
+
+[tasks.check]
+description = "Check all Rust crates"
+run = "cargo check --workspace --all-targets"
+
+[tasks.clippy]
+description = "Lint all Rust crates"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run all Rust tests"
+run = "cargo test --workspace --all-targets"
+
+[tasks.ci]
+description = "Run the full local validation suite"
+run = [
+    "mise run fmt",
+    "mise run check",
+    "mise run clippy",
+    "mise run test",
+]
