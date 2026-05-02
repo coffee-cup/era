@@ -137,6 +137,8 @@ The user-facing surface. A thin layer that translates user intent into repositor
 
 The library API is the primary interface; the CLI is a thin shell over it. This ordering matters: the library should be usable directly from agent harnesses, editor plugins, and other tooling without going through a subprocess. Agents are first-class clients.
 
+The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap --message "..."`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints concise script-friendly stdout, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set.
+
 ---
 
 ## Cross-Cutting Concerns

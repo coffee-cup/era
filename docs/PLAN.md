@@ -70,9 +70,9 @@ Status: implemented.
 
 ### 1. Thin CLI
 
-Expose only the workflows needed to play with the system.
+Status: initial commands implemented.
 
-Initial commands:
+Implemented commands expose the repository flows needed to play with the system from the current directory:
 
 ```sh
 era init
@@ -80,7 +80,9 @@ era snap --message "..."
 era timeline
 ```
 
-Then add:
+The CLI is covered by integration tests that run the compiled `era` binary through init/snapshot/timeline flows in temporary repositories and verify user-facing errors.
+
+Next CLI expansion:
 
 ```sh
 era mark "label"

@@ -15,7 +15,7 @@ The v0 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.
 
 ## Current status
 
-The implemented foundation now covers content-addressed objects, working-directory capture, and repository snapshots: BLAKE3 object IDs plus deterministic tree/snapshot types in `era-core`, an async local blob/tree/snapshot store in `era-object-store`, a configurable filesystem scanner in `era-materialization`, and repository init/manual snapshot/timeline APIs in `era-repository`. CLI workflows are tracked in [`docs/PLAN.md`](docs/PLAN.md).
+The implemented foundation now covers content-addressed objects, working-directory capture, repository snapshots, and initial CLI workflows: BLAKE3 object IDs plus deterministic tree/snapshot types in `era-core`, an async local blob/tree/snapshot store in `era-object-store`, a configurable filesystem scanner in `era-materialization`, repository init/manual snapshot/timeline APIs in `era-repository`, and a thin `era` CLI over those APIs. CLI workflow expansion is tracked in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Prerequisites
 
@@ -25,12 +25,24 @@ This repository uses [`mise`](https://mise.jdx.dev/) to manage tools and run tas
 mise install
 ```
 
+## CLI usage
+
+Run commands from the working-directory root for this initial CLI slice:
+
+```sh
+era init
+era snap --message "manual checkpoint"
+era timeline
+```
+
+When running from the workspace without installing the binary, use `cargo run -p era-cli --bin era -- <command>`.
+
 ## Tracing
 
 Runtime tracing is off by default. Enable it with `ERA_LOG` or `RUST_LOG`:
 
 ```sh
-ERA_LOG=debug cargo run -p era-cli --bin era
+ERA_LOG=debug era timeline
 ERA_LOG=era_object_store=trace cargo test -p era-object-store -- --nocapture
 ```
 
