@@ -1,4 +1,5 @@
 use anstyle::{AnsiColor, Style};
+use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use era_core::{ObjectId, Snapshot};
 use era_materialization::{CaptureIssueKind, CaptureStats, FilesystemMaterializer};
@@ -38,9 +39,9 @@ enum Commands {
     Init,
     /// Capture a manual snapshot of the current repository.
     Snap {
-        /// Human-facing message attached to the snapshot.
+        /// Human-facing message attached to the snapshot. Defaults to the current local time.
         #[arg(short, long)]
-        message: String,
+        message: Option<String>,
         /// Optional author recorded on the snapshot.
         #[arg(long)]
         author: Option<String>,
@@ -70,20 +71,20 @@ async fn init(verbose: bool) -> Result<(), CliError> {
     .await?;
     let branch = result.repository.current_branch().await?;
 
-    print_snapshot_result(
-        "Initialized Era repository",
-        &result.snapshot,
-        &branch,
-        verbose,
-    );
+    print_init_result(&result, &branch, verbose);
     print_capture_warnings(&result.snapshot);
     Ok(())
 }
 
-async fn snap(message: String, author: Option<String>, verbose: bool) -> Result<(), CliError> {
+async fn snap(
+    message: Option<String>,
+    author: Option<String>,
+    verbose: bool,
+) -> Result<(), CliError> {
     let materializer = FilesystemMaterializer::new();
     let repository = Repository::open(current_directory()?).await?;
     let branch = repository.current_branch().await?;
+    let message = message.unwrap_or_else(default_snapshot_message);
     let mut request = SnapshotRequest::manual(message);
     if let Some(author) = author {
         request = request.with_author(author);
@@ -126,6 +127,25 @@ async fn timeline(verbose: bool) -> Result<(), CliError> {
 
 fn current_directory() -> Result<PathBuf, CliError> {
     std::env::current_dir().map_err(|source| CliError::CurrentDirectory { source })
+}
+
+fn default_snapshot_message() -> String {
+    format_snapshot_message_time(Local::now())
+}
+
+fn format_snapshot_message_time(timestamp: DateTime<Local>) -> String {
+    timestamp.format("%b %-d, %Y %H:%M:%S").to_string()
+}
+
+fn print_init_result(result: &era_repository::InitResult, branch: &BranchName, verbose: bool) {
+    let metadata = result.repository.metadata_dir().display();
+    let style = success_style();
+    anstream::println!("{style}Initialized Era repository in {metadata}{style:#}");
+
+    if verbose {
+        anstream::println!();
+        print_snapshot_details(&result.snapshot, branch);
+    }
 }
 
 fn print_snapshot_result(
@@ -408,6 +428,21 @@ fn tracing_filter_from_directive(directive: Option<String>) -> EnvFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_snapshot_message_uses_readable_local_time() {
+        use chrono::TimeZone as _;
+
+        let timestamp = Local
+            .with_ymd_and_hms(2024, 1, 1, 11, 11, 11)
+            .single()
+            .expect("test timestamp should exist in the local timezone");
+
+        assert_eq!(
+            format_snapshot_message_time(timestamp),
+            "Jan 1, 2024 11:11:11"
+        );
+    }
 
     #[test]
     fn tracing_filter_accepts_valid_directive() {

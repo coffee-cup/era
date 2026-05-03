@@ -31,12 +31,13 @@ Run commands from the working-directory root for this initial CLI slice:
 
 ```sh
 era init
+era snap
 era snap --message "manual checkpoint"
 era status
 era timeline
 ```
 
-`era status` reports the current branch and last captured snapshot; working-directory diffing is not implemented yet. Use `--verbose` on any command for full object IDs, root tree IDs, timestamps, paths, and capture stats:
+`era snap` captures the current state. If no message is supplied, Era uses the current local timestamp in the form `Jan 1, 2024 11:11:11`. `era status` reports the current branch and last captured snapshot; working-directory diffing is not implemented yet. Use `--verbose` on any command for full object IDs, root tree IDs, timestamps, paths, and capture stats:
 
 ```sh
 era --verbose status

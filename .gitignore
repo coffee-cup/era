@@ -1,4 +1,5 @@
 /target/
+/test/
 /.mise.local.toml
 .env
 .env.*

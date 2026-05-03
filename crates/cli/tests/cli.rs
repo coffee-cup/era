@@ -11,24 +11,19 @@ fn init_snap_and_timeline_full_flow_uses_clean_default_output() -> Result<(), Bo
     let init = era(work).arg("init").assert().success();
     let init_stdout = output_text(&init.get_output().stdout)?;
     assert_no_ansi(&init_stdout);
-    assert!(init_stdout.starts_with("✓ Initialized Era repository\n"));
-    assert!(init_stdout.contains("Snapshot"));
-    assert!(init_stdout.contains("Captured   1 file, 1 directory, 6 B"));
-    assert!(!init_stdout.contains("Full snapshot"));
+    assert!(init_stdout.starts_with("Initialized Era repository in "));
+    assert!(init_stdout.contains("/.era\n"));
+    assert!(!init_stdout.contains("Snapshot"));
+    assert!(!init_stdout.contains("Captured"));
     assert!(work.join(".era/HEAD").is_file());
     assert!(work.join(".era/refs/heads/main").is_file());
-    let initial_snapshot = field_line_value(&init_stdout, "Snapshot");
-    assert_short_object_id(initial_snapshot);
-
     let status = era(work).arg("status").assert().success();
     let status_stdout = output_text(&status.get_output().stdout)?;
     assert_no_ansi(&status_stdout);
     assert!(status_stdout.starts_with("✓ Repository status\n"));
     assert_eq!(field_line_value(&status_stdout, "Branch"), "main");
-    assert_eq!(
-        field_line_value(&status_stdout, "Snapshot"),
-        initial_snapshot
-    );
+    let initial_snapshot = field_line_value(&status_stdout, "Snapshot");
+    assert_short_object_id(initial_snapshot);
     assert_eq!(field_line_value(&status_stdout, "Timeline"), "1 snapshot");
     assert!(field_line_value(&status_stdout, "Working").contains("not compared yet"));
 
@@ -184,16 +179,16 @@ fn snap_status_and_timeline_report_missing_repository_error() -> Result<(), Box<
 }
 
 #[test]
-fn snap_requires_message() -> Result<(), Box<dyn Error>> {
+fn snap_without_message_uses_timestamp_message() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let work = temp.path();
     era(work).arg("init").assert().success();
 
-    let snap = era(work).arg("snap").assert().failure();
-    let stderr = output_text(&snap.get_output().stderr)?;
+    let snap = era(work).arg("snap").assert().success();
+    let stdout = output_text(&snap.get_output().stdout)?;
+    let message = field_line_value(&stdout, "Message");
 
-    assert!(stderr.contains("required arguments were not provided"));
-    assert!(stderr.contains("--message <MESSAGE>"));
+    assert_timestamp_message(message)?;
     Ok(())
 }
 
@@ -231,6 +226,45 @@ fn assert_short_object_id(value: &str) {
 fn assert_object_id(value: &str) {
     assert_eq!(value.len(), 64, "object ID should be 64 hex chars");
     assert_hex(value);
+}
+
+fn assert_timestamp_message(value: &str) -> Result<(), Box<dyn Error>> {
+    let mut parts = value.split_whitespace();
+    let month = parts.next().expect("timestamp should have month");
+    let day = parts.next().expect("timestamp should have day");
+    let year = parts.next().expect("timestamp should have year");
+    let time = parts.next().expect("timestamp should have time");
+    assert!(parts.next().is_none(), "timestamp should have four fields");
+    assert!(
+        matches!(
+            month,
+            "Jan"
+                | "Feb"
+                | "Mar"
+                | "Apr"
+                | "May"
+                | "Jun"
+                | "Jul"
+                | "Aug"
+                | "Sep"
+                | "Oct"
+                | "Nov"
+                | "Dec"
+        ),
+        "unexpected month: {month}"
+    );
+    assert!(day.ends_with(','), "day should end with comma: {day}");
+    let day_number = day.trim_end_matches(',').parse::<u8>()?;
+    assert!((1..=31).contains(&day_number));
+    let year_number = year.parse::<u16>()?;
+    assert!(year_number >= 2024);
+    let time_parts = time.split(':').collect::<Vec<_>>();
+    assert_eq!(time_parts.len(), 3, "time should be HH:MM:SS");
+    for part in time_parts {
+        assert_eq!(part.len(), 2, "time fields should be zero-padded");
+        assert!(part.parse::<u8>().is_ok(), "time field should be numeric");
+    }
+    Ok(())
 }
 
 fn assert_hex(value: &str) {

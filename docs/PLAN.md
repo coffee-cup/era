@@ -76,12 +76,13 @@ Implemented commands expose the repository flows needed to play with the system 
 
 ```sh
 era init
+era snap
 era snap --message "..."
 era status
 era timeline
 ```
 
-Commands use clean default output with adaptive terminal coloring and a global `--verbose` flag for full object IDs, root tree IDs, timestamps, repository paths, and capture stats.
+Commands use clean default output with adaptive terminal coloring and a global `--verbose` flag for full object IDs, root tree IDs, timestamps, repository paths, and capture stats. `era snap` accepts an optional message and defaults to the current local timestamp formatted like `Jan 1, 2024 11:11:11`.
 
 The CLI is covered by integration tests that run the compiled `era` binary through init/snapshot/status/timeline flows in temporary repositories and verify user-facing errors.
 

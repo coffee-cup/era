@@ -137,7 +137,7 @@ The user-facing surface. A thin layer that translates user intent into repositor
 
 The library API is the primary interface; the CLI is a thin shell over it. This ordering matters: the library should be usable directly from agent harnesses, editor plugins, and other tooling without going through a subprocess. Agents are first-class clients.
 
-The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap --message "..."`, `era status`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era status` reports repository metadata and the current branch snapshot; it does not compare unsnapshotted working-directory changes yet.
+The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap`, `era snap --message "..."`, `era status`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era snap` accepts an optional message and defaults to the current local timestamp formatted like `Jan 1, 2024 11:11:11`. `era status` reports repository metadata and the current branch snapshot; it does not compare unsnapshotted working-directory changes yet.
 
 ---
 
