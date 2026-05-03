@@ -77,10 +77,13 @@ Implemented commands expose the repository flows needed to play with the system 
 ```sh
 era init
 era snap --message "..."
+era status
 era timeline
 ```
 
-The CLI is covered by integration tests that run the compiled `era` binary through init/snapshot/timeline flows in temporary repositories and verify user-facing errors.
+Commands use clean default output with adaptive terminal coloring and a global `--verbose` flag for full object IDs, root tree IDs, timestamps, repository paths, and capture stats.
+
+The CLI is covered by integration tests that run the compiled `era` binary through init/snapshot/status/timeline flows in temporary repositories and verify user-facing errors.
 
 Next CLI expansion:
 

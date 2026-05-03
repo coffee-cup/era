@@ -32,7 +32,15 @@ Run commands from the working-directory root for this initial CLI slice:
 ```sh
 era init
 era snap --message "manual checkpoint"
+era status
 era timeline
+```
+
+`era status` reports the current branch and last captured snapshot; working-directory diffing is not implemented yet. Use `--verbose` on any command for full object IDs, root tree IDs, timestamps, paths, and capture stats:
+
+```sh
+era --verbose status
+era timeline --verbose
 ```
 
 When running from the workspace without installing the binary, use `cargo run -p era-cli --bin era -- <command>`.
@@ -46,7 +54,7 @@ ERA_LOG=debug era timeline
 ERA_LOG=era_object_store=trace cargo test -p era-object-store -- --nocapture
 ```
 
-Tracing output is written to stderr so command stdout stays script-friendly.
+Tracing output is written to stderr. Human-facing command output uses terminal colors when supported and automatically strips ANSI escapes when output is redirected or captured.
 
 ## Development
 

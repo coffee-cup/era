@@ -43,7 +43,7 @@ A directory listing — an ordered set of named entries, each pointing to either
 
 In the current implementation, tree entries use UTF-8 single-segment names. Emoji and non-English characters are supported and preserved exactly; Unicode normalization is not applied. Empty names, `.`, `..`, names containing `/`, and names containing NUL are invalid.
 
-This is the copy-on-write magic: changing a single file in a deeply nested directory rewrites only that file's blob, the tree containing it, and the trees on the path back to the root. Everything else is shared with the prior state.
+This is the object-level copy-on-write magic: changing a single file in a deeply nested directory writes a new blob for that full file, the tree containing it, and the trees on the path back to the root. Everything else is shared with the prior state. The current implementation does not do filesystem-level CoW, block-level chunking, or delta compression; if one byte changes in a large file, the changed file is stored as a new full blob.
 
 ### Snapshot
 
@@ -137,7 +137,7 @@ The user-facing surface. A thin layer that translates user intent into repositor
 
 The library API is the primary interface; the CLI is a thin shell over it. This ordering matters: the library should be usable directly from agent harnesses, editor plugins, and other tooling without going through a subprocess. Agents are first-class clients.
 
-The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap --message "..."`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints concise script-friendly stdout, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set.
+The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap --message "..."`, `era status`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era status` reports repository metadata and the current branch snapshot; it does not compare unsnapshotted working-directory changes yet.
 
 ---
 
