@@ -220,6 +220,201 @@ async fn manual_snapshot_advances_current_branch_and_records_parent() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn working_tree_status_detects_clean_and_dirty_states() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+
+    let clean = repo.working_tree_status(&materializer).await.unwrap();
+    assert!(clean.is_clean());
+    assert_eq!(clean.snapshot_id, init.snapshot.snapshot_id);
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let dirty = repo.working_tree_status(&materializer).await.unwrap();
+    assert!(!dirty.is_clean());
+    assert_ne!(dirty.current_root_tree_id, dirty.snapshot.root_tree_id());
+
+    repo.snapshot(
+        &materializer,
+        SnapshotRequest::manual("saved").with_timestamp_millis(2),
+    )
+    .await
+    .unwrap();
+    assert!(
+        repo.working_tree_status(&materializer)
+            .await
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn branch_create_switch_and_restore_cover_local_workflows() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+    let feature = BranchName::new("feature").unwrap();
+
+    let branch = repo
+        .create_branch(&materializer, feature.clone())
+        .await
+        .unwrap();
+    assert_eq!(branch.snapshot_id, init.snapshot.snapshot_id);
+    assert!(branch.saved_snapshot.is_none());
+    assert_eq!(repo.current_branch().await.unwrap(), BranchName::main());
+    assert_eq!(
+        repo.branches()
+            .await
+            .unwrap()
+            .iter()
+            .map(|branch| branch.name.as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["feature".to_owned(), "main".to_owned()]
+    );
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let main_tip = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("main two").with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+
+    let switched = repo
+        .switch_branch(&materializer, feature.clone())
+        .await
+        .unwrap();
+    assert_eq!(switched.branch, feature);
+    assert_eq!(repo.current_branch().await.unwrap().as_str(), "feature");
+    assert_eq!(fs::read(work.join("README.md")).await.unwrap(), b"one");
+
+    fs::write(work.join("README.md"), b"feature work")
+        .await
+        .unwrap();
+    let switched = repo
+        .switch_branch(&materializer, BranchName::main())
+        .await
+        .unwrap();
+    assert!(switched.saved_snapshot.is_some());
+    assert_eq!(switched.snapshot_id, main_tip.snapshot_id);
+    assert_eq!(repo.current_branch().await.unwrap(), BranchName::main());
+    assert_eq!(fs::read(work.join("README.md")).await.unwrap(), b"two");
+
+    let restored = repo.restore(&materializer, "main two").await.unwrap();
+    assert_eq!(restored.snapshot_id, main_tip.snapshot_id);
+    assert_eq!(fs::read(work.join("README.md")).await.unwrap(), b"two");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_targets_resolve_full_ids_prefixes_and_messages() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let second = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("second label").with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+    let prefix = second
+        .snapshot_id
+        .to_hex()
+        .chars()
+        .take(12)
+        .collect::<String>();
+
+    assert_eq!(
+        repo.resolve_snapshot_target(&second.snapshot_id.to_string())
+            .await
+            .unwrap()
+            .snapshot_id,
+        second.snapshot_id
+    );
+    assert_eq!(
+        repo.resolve_snapshot_target(&prefix)
+            .await
+            .unwrap()
+            .snapshot_id,
+        second.snapshot_id
+    );
+    assert_eq!(
+        repo.resolve_snapshot_target("second label")
+            .await
+            .unwrap()
+            .snapshot_id,
+        second.snapshot_id
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_auto_saves_dirty_work_before_materializing_target() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let saved_two = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("two").with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+    fs::write(work.join("README.md"), b"three").await.unwrap();
+
+    let restored = repo.restore(&materializer, "two").await.unwrap();
+
+    assert_eq!(restored.snapshot_id, saved_two.snapshot_id);
+    assert!(restored.saved_snapshot.is_some());
+    assert_eq!(fs::read(work.join("README.md")).await.unwrap(), b"two");
+    assert!(
+        !repo
+            .working_tree_status(&materializer)
+            .await
+            .unwrap()
+            .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn timeline_walks_first_parent_newest_to_oldest() {
     let temp = TempDir::new().unwrap();
     let work = create_workdir(&temp).await;

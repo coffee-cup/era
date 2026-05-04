@@ -27,17 +27,22 @@ mise install
 
 ## CLI usage
 
-Run commands from the working-directory root for this initial CLI slice:
+Run commands from the working-directory root:
 
 ```sh
 era init
 era snap
+era snap "manual checkpoint"
 era snap --message "manual checkpoint"
 era status
+era branch
+era branch experiment
+era switch experiment
+era restore "manual checkpoint"
 era timeline
 ```
 
-`era snap` captures the current state. If no message is supplied, Era uses the current local timestamp in the form `Jan 1, 2024 11:11:11`. `era status` reports the current branch and last captured snapshot; working-directory diffing is not implemented yet. Use `--verbose` on any command for full object IDs, root tree IDs, timestamps, paths, and capture stats:
+`era snap` captures the current state and attaches a human-facing label. If no label is supplied, Era uses the current local timestamp in the form `Jan 1, 2024 11:11:11`. `era status` reports whether the working tree matches the current saved snapshot. `era branch` lists or creates branches, `era switch` saves current work before switching branches, and `era restore` saves current work before restoring a snapshot ID, unique ID prefix, or exact snapshot label. Use `--verbose` on any command for full object IDs, root tree IDs, timestamps, paths, and capture/materialization stats:
 
 ```sh
 era --verbose status

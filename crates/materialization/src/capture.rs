@@ -25,6 +25,20 @@ pub trait Materializer: Send + Sync {
         working_directory: &WorkingDirectory,
         object_store: &dyn ObjectStore,
     ) -> Result<CaptureResult, MaterializationError>;
+
+    /// Scans the current working directory and returns the tree ID it would capture.
+    async fn scan_tree(
+        &self,
+        working_directory: &WorkingDirectory,
+    ) -> Result<TreeScanResult, MaterializationError>;
+
+    /// Reconciles the working directory to match a stored tree.
+    async fn materialize_tree(
+        &self,
+        root_tree_id: ObjectId,
+        working_directory: &WorkingDirectory,
+        object_store: &dyn ObjectStore,
+    ) -> Result<MaterializeResult, MaterializationError>;
 }
 
 /// Configuration for scanning a working directory.
@@ -127,6 +141,72 @@ impl CaptureResult {
             issues,
         }
     }
+}
+
+/// Result of scanning a working directory without storing objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeScanResult {
+    /// Object ID of the scanned root tree.
+    pub root_tree_id: ObjectId,
+    /// Aggregate scan counts.
+    pub stats: TreeScanStats,
+    /// Non-fatal issues encountered during scan.
+    pub issues: Vec<CaptureIssue>,
+}
+
+impl TreeScanResult {
+    /// Creates a tree scan result.
+    #[must_use]
+    pub fn new(root_tree_id: ObjectId, stats: TreeScanStats, issues: Vec<CaptureIssue>) -> Self {
+        Self {
+            root_tree_id,
+            stats,
+            issues,
+        }
+    }
+}
+
+/// Aggregate counts for a read-only tree scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TreeScanStats {
+    /// Regular files included in the scanned tree.
+    pub files_seen: usize,
+    /// Directories included in the scanned tree, including the root directory.
+    pub directories_seen: usize,
+    /// Bytes read from regular files.
+    pub bytes_read: u64,
+    /// Directory entries skipped by configured exclusions.
+    pub ignored_entries: usize,
+    /// Symlink entries skipped by [`SymlinkPolicy::Skip`].
+    pub symlinks_skipped: usize,
+}
+
+/// Result of materializing a stored tree into a working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializeResult {
+    /// Aggregate filesystem reconciliation counts.
+    pub stats: MaterializeStats,
+}
+
+impl MaterializeResult {
+    /// Creates a materialization result.
+    #[must_use]
+    pub fn new(stats: MaterializeStats) -> Self {
+        Self { stats }
+    }
+}
+
+/// Aggregate counts for materializing a tree into a working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MaterializeStats {
+    /// Regular files written from blob objects.
+    pub files_written: usize,
+    /// Directories created while materializing tree objects.
+    pub directories_created: usize,
+    /// Filesystem entries removed because they were not present in the target tree.
+    pub entries_removed: usize,
+    /// Bytes written to regular files.
+    pub bytes_written: u64,
 }
 
 /// Aggregate counts for a capture operation.

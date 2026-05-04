@@ -2,15 +2,18 @@ use crate::{
     BranchName, RepositoryError,
     error::io_error,
     refs::{
-        branch_ref_path, create_ref_layout, head_path, metadata_dir, objects_dir, read_branch_ref,
-        read_head_branch, write_branch_ref, write_head,
+        branch_ref_exists, branch_ref_path, create_branch_ref, create_ref_layout, head_path,
+        list_branch_refs, metadata_dir, objects_dir, read_branch_ref, read_head_branch,
+        write_branch_ref, write_head,
     },
 };
-use era_core::{ObjectId, Snapshot, SnapshotProvenance};
-use era_materialization::{CaptureResult, Materializer, WorkingDirectory};
+use era_core::{ObjectId, ObjectKind, Snapshot, SnapshotProvenance};
+use era_materialization::{
+    CaptureResult, MaterializeResult, Materializer, TreeScanResult, WorkingDirectory,
+};
 use era_object_store::LocalObjectStore;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -122,6 +125,183 @@ impl Repository {
         Ok(snapshot)
     }
 
+    /// Returns whether the working directory matches the current branch snapshot.
+    pub async fn working_tree_status(
+        &self,
+        materializer: &dyn Materializer,
+    ) -> Result<WorkingTreeStatus, RepositoryError> {
+        let snapshot_id = self.current_snapshot_id().await?;
+        let snapshot = self.object_store.get_snapshot(&snapshot_id).await?;
+        let working_directory = WorkingDirectory::new(&self.root);
+        let scan = materializer.scan_tree(&working_directory).await?;
+        let current_root_tree_id = scan.root_tree_id;
+        let clean = current_root_tree_id == snapshot.root_tree_id();
+
+        Ok(WorkingTreeStatus {
+            snapshot_id,
+            snapshot,
+            current_root_tree_id,
+            clean,
+            scan,
+        })
+    }
+
+    /// Lists local branches sorted by name.
+    pub async fn branches(&self) -> Result<Vec<BranchHead>, RepositoryError> {
+        let current = self.current_branch().await?;
+        let branches = list_branch_refs(&self.metadata_dir)
+            .await?
+            .into_iter()
+            .map(|(name, snapshot_id)| {
+                let is_current = name == current;
+                BranchHead {
+                    name,
+                    snapshot_id,
+                    is_current,
+                }
+            })
+            .collect();
+
+        Ok(branches)
+    }
+
+    /// Creates a branch at the current saved state, saving unsnapped work first.
+    pub async fn create_branch(
+        &self,
+        materializer: &dyn Materializer,
+        name: BranchName,
+    ) -> Result<BranchOperationResult, RepositoryError> {
+        if branch_ref_exists(&self.metadata_dir, &name).await? {
+            return Err(RepositoryError::BranchAlreadyExists { name });
+        }
+
+        let saved_snapshot = self.save_current_state_if_changed(materializer).await?;
+        let snapshot_id = self.current_snapshot_id().await?;
+        create_branch_ref(&self.metadata_dir, &name, snapshot_id).await?;
+
+        debug!(branch = name.as_str(), %snapshot_id, "created branch");
+        Ok(BranchOperationResult {
+            branch: name,
+            snapshot_id,
+            saved_snapshot,
+        })
+    }
+
+    /// Switches HEAD to an existing branch, saving unsnapped work first.
+    pub async fn switch_branch(
+        &self,
+        materializer: &dyn Materializer,
+        name: BranchName,
+    ) -> Result<SwitchResult, RepositoryError> {
+        if !branch_ref_exists(&self.metadata_dir, &name).await? {
+            return Err(RepositoryError::BranchNotFound { name });
+        }
+
+        let saved_snapshot = self.save_current_state_if_changed(materializer).await?;
+        let snapshot_id = read_branch_ref(&self.metadata_dir, &name).await?;
+        let snapshot = self.object_store.get_snapshot(&snapshot_id).await?;
+        let working_directory = WorkingDirectory::new(&self.root);
+        let materialization = materializer
+            .materialize_tree(
+                snapshot.root_tree_id(),
+                &working_directory,
+                &self.object_store,
+            )
+            .await?;
+        write_head(&self.metadata_dir, &name).await?;
+
+        debug!(branch = name.as_str(), %snapshot_id, "switched branch");
+        Ok(SwitchResult {
+            branch: name,
+            snapshot_id,
+            snapshot,
+            saved_snapshot,
+            materialization,
+        })
+    }
+
+    /// Restores a snapshot target into the working directory without moving the current branch.
+    pub async fn restore(
+        &self,
+        materializer: &dyn Materializer,
+        target: &str,
+    ) -> Result<RestoreResult, RepositoryError> {
+        let resolved = self.resolve_snapshot_target(target).await?;
+        let saved_snapshot = self.save_current_state_if_changed(materializer).await?;
+        let working_directory = WorkingDirectory::new(&self.root);
+        let materialization = materializer
+            .materialize_tree(
+                resolved.snapshot.root_tree_id(),
+                &working_directory,
+                &self.object_store,
+            )
+            .await?;
+
+        debug!(target, snapshot = %resolved.snapshot_id, "restored snapshot target");
+        Ok(RestoreResult {
+            snapshot_id: resolved.snapshot_id,
+            snapshot: resolved.snapshot,
+            saved_snapshot,
+            materialization,
+        })
+    }
+
+    /// Resolves a snapshot target from a full ID, unique prefix, or exact message.
+    pub async fn resolve_snapshot_target(
+        &self,
+        target: &str,
+    ) -> Result<ResolvedSnapshot, RepositoryError> {
+        let full_id_snapshot = if let Ok(id) = ObjectId::from_hex(target) {
+            if self
+                .object_store
+                .contains(ObjectKind::Snapshot, &id)
+                .await?
+            {
+                Some((id, self.object_store.get_snapshot(&id).await?))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((snapshot_id, snapshot)) = full_id_snapshot {
+            return Ok(ResolvedSnapshot {
+                snapshot_id,
+                snapshot,
+            });
+        }
+
+        let mut matches = BTreeMap::new();
+        let target_is_hex_prefix =
+            !target.is_empty() && target.bytes().all(|byte| byte.is_ascii_hexdigit());
+        for entry in self.timeline().await? {
+            if target_is_hex_prefix && entry.snapshot_id.to_hex().starts_with(target) {
+                matches.insert(entry.snapshot_id, entry.snapshot.clone());
+            }
+
+            if entry.snapshot.message() == Some(target) {
+                matches.insert(entry.snapshot_id, entry.snapshot);
+            }
+        }
+
+        match matches.len() {
+            0 => Err(RepositoryError::SnapshotTargetNotFound {
+                target: target.to_owned(),
+            }),
+            1 => {
+                let (snapshot_id, snapshot) = matches.into_iter().next().expect("one match");
+                Ok(ResolvedSnapshot {
+                    snapshot_id,
+                    snapshot,
+                })
+            }
+            _ => Err(RepositoryError::SnapshotTargetAmbiguous {
+                target: target.to_owned(),
+                matches: matches.keys().copied().collect(),
+            }),
+        }
+    }
+
     /// Returns the branch named by HEAD.
     pub async fn current_branch(&self) -> Result<BranchName, RepositoryError> {
         read_head_branch(&self.metadata_dir).await
@@ -171,6 +351,20 @@ impl Repository {
     #[must_use]
     pub fn head_path(&self) -> PathBuf {
         head_path(&self.metadata_dir)
+    }
+
+    async fn save_current_state_if_changed(
+        &self,
+        materializer: &dyn Materializer,
+    ) -> Result<Option<SnapshotResult>, RepositoryError> {
+        let status = self.working_tree_status(materializer).await?;
+        if status.is_clean() {
+            Ok(None)
+        } else {
+            self.snapshot(materializer, SnapshotRequest::automatic())
+                .await
+                .map(Some)
+        }
     }
 
     async fn capture_snapshot(
@@ -234,6 +428,17 @@ impl SnapshotRequest {
         }
     }
 
+    /// Creates request metadata for an automatic safety snapshot.
+    #[must_use]
+    pub fn automatic() -> Self {
+        Self {
+            timestamp_millis: None,
+            author: None,
+            message: None,
+            provenance: SnapshotProvenance::automatic(),
+        }
+    }
+
     /// Sets a deterministic timestamp in milliseconds since the Unix epoch.
     #[must_use]
     pub fn with_timestamp_millis(mut self, timestamp_millis: u64) -> Self {
@@ -287,6 +492,88 @@ pub struct SnapshotResult {
     pub snapshot: Snapshot,
     /// Working-directory capture result used by this snapshot.
     pub capture: CaptureResult,
+}
+
+/// Status of the working tree relative to the current branch snapshot.
+#[derive(Debug, Clone)]
+pub struct WorkingTreeStatus {
+    /// Current branch snapshot ID.
+    pub snapshot_id: ObjectId,
+    /// Current branch snapshot contents.
+    pub snapshot: Snapshot,
+    /// Root tree ID computed from the current working directory.
+    pub current_root_tree_id: ObjectId,
+    /// Whether the working directory root tree matches the saved snapshot root tree.
+    pub clean: bool,
+    /// Read-only scan result used for the comparison.
+    pub scan: TreeScanResult,
+}
+
+impl WorkingTreeStatus {
+    /// Returns `true` when the working directory matches the current snapshot.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.clean
+    }
+}
+
+/// A local branch and the snapshot it points to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchHead {
+    /// Branch name.
+    pub name: BranchName,
+    /// Snapshot ID stored in the branch ref.
+    pub snapshot_id: ObjectId,
+    /// Whether this branch is currently checked out.
+    pub is_current: bool,
+}
+
+/// Result returned when creating a branch.
+#[derive(Debug, Clone)]
+pub struct BranchOperationResult {
+    /// Branch name that was created.
+    pub branch: BranchName,
+    /// Snapshot ID the new branch points at.
+    pub snapshot_id: ObjectId,
+    /// Safety snapshot created before the operation when the working tree was dirty.
+    pub saved_snapshot: Option<SnapshotResult>,
+}
+
+/// Result returned when switching branches.
+#[derive(Debug, Clone)]
+pub struct SwitchResult {
+    /// Branch switched to.
+    pub branch: BranchName,
+    /// Snapshot ID materialized for the branch.
+    pub snapshot_id: ObjectId,
+    /// Snapshot materialized for the branch.
+    pub snapshot: Snapshot,
+    /// Safety snapshot created before the operation when the working tree was dirty.
+    pub saved_snapshot: Option<SnapshotResult>,
+    /// Filesystem materialization result.
+    pub materialization: MaterializeResult,
+}
+
+/// Result returned when restoring a snapshot target.
+#[derive(Debug, Clone)]
+pub struct RestoreResult {
+    /// Snapshot ID materialized into the working directory.
+    pub snapshot_id: ObjectId,
+    /// Snapshot materialized into the working directory.
+    pub snapshot: Snapshot,
+    /// Safety snapshot created before the operation when the working tree was dirty.
+    pub saved_snapshot: Option<SnapshotResult>,
+    /// Filesystem materialization result.
+    pub materialization: MaterializeResult,
+}
+
+/// A resolved snapshot target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSnapshot {
+    /// Resolved snapshot ID.
+    pub snapshot_id: ObjectId,
+    /// Resolved snapshot contents.
+    pub snapshot: Snapshot,
 }
 
 /// A timeline entry loaded from snapshot history.

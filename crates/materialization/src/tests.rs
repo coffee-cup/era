@@ -206,6 +206,85 @@ async fn exclusion_list_can_be_overridden() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn scan_tree_matches_capture_without_storing_objects() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"hello").await.unwrap();
+    fs::create_dir(work.join("src")).await.unwrap();
+    fs::write(work.join("src/main.rs"), b"fn main() {}\n")
+        .await
+        .unwrap();
+    fs::create_dir(work.join("target")).await.unwrap();
+    fs::write(work.join("target/generated.txt"), b"ignored")
+        .await
+        .unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+
+    let scan = materializer
+        .scan_tree(&WorkingDirectory::new(&work))
+        .await
+        .unwrap();
+    let capture = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert_eq!(scan.root_tree_id, capture.root_tree_id);
+    assert_eq!(scan.stats.files_seen, capture.stats.files_seen);
+    assert_eq!(scan.stats.directories_seen, capture.stats.directories_seen);
+    assert_eq!(scan.stats.bytes_read, capture.stats.bytes_read);
+    assert_eq!(scan.stats.ignored_entries, capture.stats.ignored_entries);
+    assert_eq!(scan.stats.symlinks_skipped, capture.stats.symlinks_skipped);
+    assert_eq!(scan.issues, capture.issues);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn materialize_tree_reconciles_working_directory_and_preserves_excluded_dirs() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    fs::create_dir(work.join("src")).await.unwrap();
+    fs::write(work.join("src/main.rs"), b"fn main() {}\n")
+        .await
+        .unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+    let captured = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    fs::remove_dir_all(work.join("src")).await.unwrap();
+    fs::write(work.join("extra.txt"), b"remove me")
+        .await
+        .unwrap();
+    fs::create_dir(work.join("target")).await.unwrap();
+    fs::write(work.join("target/generated.txt"), b"preserve me")
+        .await
+        .unwrap();
+
+    let result = materializer
+        .materialize_tree(captured.root_tree_id, &WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert_eq!(fs::read(work.join("README.md")).await.unwrap(), b"one");
+    assert_eq!(
+        fs::read(work.join("src/main.rs")).await.unwrap(),
+        b"fn main() {}\n"
+    );
+    assert!(fs::metadata(work.join("extra.txt")).await.is_err());
+    assert_eq!(
+        fs::read(work.join("target/generated.txt")).await.unwrap(),
+        b"preserve me"
+    );
+    assert!(result.stats.files_written >= 2);
+    assert!(result.stats.entries_removed >= 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn second_capture_reflects_deleted_files() {
     let temp = TempDir::new().unwrap();
     let work = create_workdir(&temp).await;
@@ -353,6 +432,34 @@ async fn symlinks_are_skipped_by_default_without_following() {
             PathBuf::from("link.txt"),
             CaptureIssueKind::SkippedSymlink,
         )]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn materialize_tree_preserves_skipped_symlinks() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("real.txt"), b"real").await.unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+    let captured = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    unix_fs::symlink("real.txt", work.join("link.txt")).unwrap();
+
+    materializer
+        .materialize_tree(captured.root_tree_id, &WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert!(
+        fs::symlink_metadata(work.join("link.txt"))
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
 

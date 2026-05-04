@@ -32,6 +32,12 @@ impl SnapshotProvenance {
         Self::new("manual-snapshot")
     }
 
+    /// Provenance for automatic safety snapshots created before changing context.
+    #[must_use]
+    pub fn automatic() -> Self {
+        Self::new("auto-snapshot")
+    }
+
     /// Returns the source that produced the snapshot.
     #[must_use]
     pub fn source(&self) -> &str {

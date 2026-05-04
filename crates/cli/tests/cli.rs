@@ -25,7 +25,7 @@ fn init_snap_and_timeline_full_flow_uses_clean_default_output() -> Result<(), Bo
     let initial_snapshot = field_line_value(&status_stdout, "Snapshot");
     assert_short_object_id(initial_snapshot);
     assert_eq!(field_line_value(&status_stdout, "Timeline"), "1 snapshot");
-    assert!(field_line_value(&status_stdout, "Working").contains("not compared yet"));
+    assert_eq!(field_line_value(&status_stdout, "Working"), "no changes");
 
     let first_timeline = era(work).arg("timeline").assert().success();
     let first_timeline_stdout = output_text(&first_timeline.get_output().stdout)?;
@@ -174,6 +174,115 @@ fn snap_status_and_timeline_report_missing_repository_error() -> Result<(), Box<
     let timeline_stderr = output_text(&timeline.get_output().stderr)?;
     assert_no_ansi(&timeline_stderr);
     assert!(timeline_stderr.contains("error: not an Era repository:"));
+
+    let branch = era(work).arg("branch").assert().failure();
+    let branch_stderr = output_text(&branch.get_output().stderr)?;
+    assert_no_ansi(&branch_stderr);
+    assert!(branch_stderr.contains("error: not an Era repository:"));
+
+    let switch = era(work).args(["switch", "main"]).assert().failure();
+    let switch_stderr = output_text(&switch.get_output().stderr)?;
+    assert_no_ansi(&switch_stderr);
+    assert!(switch_stderr.contains("error: not an Era repository:"));
+
+    let restore = era(work).args(["restore", "main"]).assert().failure();
+    let restore_stderr = output_text(&restore.get_output().stderr)?;
+    assert_no_ansi(&restore_stderr);
+    assert!(restore_stderr.contains("error: not an Era repository:"));
+
+    Ok(())
+}
+
+#[test]
+fn status_detects_changes_and_snap_makes_it_clean() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
+    era(work).arg("init").assert().success();
+
+    fs::write(work.join("README.md"), b"two")?;
+    let dirty = era(work).arg("status").assert().success();
+    let dirty_stdout = output_text(&dirty.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&dirty_stdout, "Working"),
+        "changes detected; run `era snap` to save"
+    );
+
+    era(work).args(["snap", "remember this"]).assert().success();
+    let clean = era(work).arg("status").assert().success();
+    let clean_stdout = output_text(&clean.get_output().stdout)?;
+    assert_eq!(field_line_value(&clean_stdout, "Working"), "no changes");
+
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+    assert!(timeline_stdout.contains("remember this"));
+    Ok(())
+}
+
+#[test]
+fn branch_switch_and_restore_support_local_workflow() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
+    era(work).arg("init").assert().success();
+
+    let branch = era(work).args(["branch", "feature"]).assert().success();
+    let branch_stdout = output_text(&branch.get_output().stdout)?;
+    assert!(branch_stdout.starts_with("✓ Created branch\n"));
+    assert_eq!(field_line_value(&branch_stdout, "Branch"), "feature");
+
+    let branches = era(work).arg("branch").assert().success();
+    let branches_stdout = output_text(&branches.get_output().stdout)?;
+    assert_no_ansi(&branches_stdout);
+    assert!(branches_stdout.contains("* main"));
+    assert!(branches_stdout.contains("feature"));
+
+    fs::write(work.join("README.md"), b"two")?;
+    era(work).args(["snap", "main two"]).assert().success();
+
+    let switch_feature = era(work).args(["switch", "feature"]).assert().success();
+    let switch_feature_stdout = output_text(&switch_feature.get_output().stdout)?;
+    assert!(switch_feature_stdout.starts_with("✓ Switched branch\n"));
+    assert_eq!(
+        field_line_value(&switch_feature_stdout, "Branch"),
+        "feature"
+    );
+    assert_eq!(fs::read(work.join("README.md"))?, b"one");
+
+    fs::write(work.join("README.md"), b"feature work")?;
+    era(work).args(["switch", "main"]).assert().success();
+    assert_eq!(fs::read(work.join("README.md"))?, b"two");
+
+    era(work).args(["restore", "main two"]).assert().success();
+    assert_eq!(fs::read(work.join("README.md"))?, b"two");
+    let status = era(work).arg("status").assert().success();
+    let status_stdout = output_text(&status.get_output().stdout)?;
+    assert_eq!(field_line_value(&status_stdout, "Working"), "no changes");
+
+    Ok(())
+}
+
+#[test]
+fn branch_switch_and_restore_report_clear_errors() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    era(work).arg("init").assert().success();
+    era(work).args(["branch", "feature"]).assert().success();
+
+    let duplicate = era(work).args(["branch", "feature"]).assert().failure();
+    let duplicate_stderr = output_text(&duplicate.get_output().stderr)?;
+    assert_no_ansi(&duplicate_stderr);
+    assert!(duplicate_stderr.contains("error: branch already exists: feature"));
+
+    let missing_branch = era(work).args(["switch", "missing"]).assert().failure();
+    let missing_branch_stderr = output_text(&missing_branch.get_output().stderr)?;
+    assert_no_ansi(&missing_branch_stderr);
+    assert!(missing_branch_stderr.contains("error: branch not found: missing"));
+
+    let missing_target = era(work).args(["restore", "missing"]).assert().failure();
+    let missing_target_stderr = output_text(&missing_target.get_output().stderr)?;
+    assert_no_ansi(&missing_target_stderr);
+    assert!(missing_target_stderr.contains("error: snapshot target not found: missing"));
 
     Ok(())
 }

@@ -1,4 +1,4 @@
-use crate::InvalidBranchName;
+use crate::{BranchName, InvalidBranchName};
 use era_core::ObjectId;
 use era_materialization::MaterializationError;
 use era_object_store::ObjectStoreError;
@@ -27,6 +27,19 @@ pub enum RepositoryError {
     InvalidRef { path: PathBuf, contents: String },
     /// A branch name could not be represented safely in the ref layout.
     InvalidBranchName { source: InvalidBranchName },
+    /// A branch ref file name could not be represented as UTF-8.
+    InvalidBranchRefName { path: PathBuf },
+    /// A branch already exists.
+    BranchAlreadyExists { name: BranchName },
+    /// A branch does not exist.
+    BranchNotFound { name: BranchName },
+    /// A snapshot target could not be resolved.
+    SnapshotTargetNotFound { target: String },
+    /// A snapshot target matched more than one snapshot.
+    SnapshotTargetAmbiguous {
+        target: String,
+        matches: Vec<ObjectId>,
+    },
     /// Timeline traversal found a cycle in snapshot parent pointers.
     SnapshotCycle { id: ObjectId },
     /// The system clock was before the Unix epoch.
@@ -88,6 +101,25 @@ impl fmt::Display for RepositoryError {
                 contents
             ),
             Self::InvalidBranchName { source } => write!(formatter, "{source}"),
+            Self::InvalidBranchRefName { path } => write!(
+                formatter,
+                "branch ref name is not UTF-8: {}",
+                path.display()
+            ),
+            Self::BranchAlreadyExists { name } => {
+                write!(formatter, "branch already exists: {name}")
+            }
+            Self::BranchNotFound { name } => write!(formatter, "branch not found: {name}"),
+            Self::SnapshotTargetNotFound { target } => {
+                write!(formatter, "snapshot target not found: {target}")
+            }
+            Self::SnapshotTargetAmbiguous { target, matches } => {
+                write!(formatter, "snapshot target is ambiguous: {target} matches")?;
+                for id in matches {
+                    write!(formatter, " {id}")?;
+                }
+                Ok(())
+            }
             Self::SnapshotCycle { id } => {
                 write!(formatter, "snapshot timeline contains a cycle at {id}")
             }
@@ -128,6 +160,11 @@ impl Error for RepositoryError {
             | Self::InvalidHead { .. }
             | Self::RefMissing { .. }
             | Self::InvalidRef { .. }
+            | Self::InvalidBranchRefName { .. }
+            | Self::BranchAlreadyExists { .. }
+            | Self::BranchNotFound { .. }
+            | Self::SnapshotTargetNotFound { .. }
+            | Self::SnapshotTargetAmbiguous { .. }
             | Self::SnapshotCycle { .. }
             | Self::TimestampOverflow { .. } => None,
         }

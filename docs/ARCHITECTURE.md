@@ -112,7 +112,7 @@ Responsibilities:
 
 In v0, materialization works by ordinary file operations — copying bytes from the object store onto the filesystem, walking the working tree to detect changes, and using a platform-appropriate filesystem watcher to observe writes. The materialization API should still be async and capability-oriented from the start, so repository code does not depend on the copy-based implementation detail.
 
-The current implementation covers the capture direction only: `FilesystemMaterializer` walks a working directory, stores regular files as blobs, stores directories as trees, and returns the captured root tree ID with stats and non-fatal issues. Capture uses configurable exact directory-name exclusions; defaults skip Era metadata, Git metadata, and common generated/transient directories such as `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`. Symlinks are not followed; by default they are skipped and reported, and callers can choose an error policy instead.
+The current implementation covers both directions for local workflows. `FilesystemMaterializer` can capture a working directory into blob/tree objects, scan a working directory without storing objects to compute the tree ID that status compares, and materialize a stored tree back into the working directory for branch switching and restore. Capture and scan use configurable exact directory-name exclusions; defaults skip Era metadata, Git metadata, and common generated/transient directories such as `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`. Symlinks are not followed; by default they are skipped and reported, and callers can choose an error policy instead. Materialization preserves excluded directories that are outside the target tree, including `.era`, so repository metadata and generated caches are not deleted during restore.
 
 This layer is intentionally a replaceable component. Future implementations (hardlink-based, reflink-based, FUSE-based) will plug in here without changing anything above. The interface this layer presents to the repository is small and stable: "checkout this snapshot at this path," "what does this path look like now," "tell me when something changes."
 
@@ -127,7 +127,7 @@ Responsibilities:
 - Implement higher-level operations: diff between snapshots, walk history, merge branches
 - Apply tracking heuristics: decide which files should and should not be part of snapshots
 
-The current repository implementation covers local init, open, manual snapshots, and first-parent timeline walking. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Manual snapshots capture the current tree, store a snapshot with the current branch tip as parent, and advance the branch ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
+The current repository implementation covers local init, open, manual snapshots, first-parent timeline walking, working-tree status comparison, branch listing/creation/switching, and whole-tree restore. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Manual snapshots capture the current tree, store a snapshot with the current branch tip as parent, and advance the branch ref. Branch creation writes another ref pointing at the current saved snapshot. Switching branches and restoring snapshots save unsnapped work first, then ask the materializer to reconcile the working directory. Restore materializes a target snapshot without moving the current branch ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
 
 The repository is where intelligence lives. It is also where most of the v0 design space is, because the rules for "when do we snapshot, what do we include, how do we merge" are precisely what differentiates this system from git.
 
@@ -137,7 +137,7 @@ The user-facing surface. A thin layer that translates user intent into repositor
 
 The library API is the primary interface; the CLI is a thin shell over it. This ordering matters: the library should be usable directly from agent harnesses, editor plugins, and other tooling without going through a subprocess. Agents are first-class clients.
 
-The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap`, `era snap --message "..."`, `era status`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era snap` accepts an optional message and defaults to the current local timestamp formatted like `Jan 1, 2024 11:11:11`. `era status` reports repository metadata and the current branch snapshot; it does not compare unsnapshotted working-directory changes yet.
+The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap`, `era snap "label"`, `era snap --message "..."`, `era status`, `era branch`, `era branch NAME`, `era switch NAME`, `era restore SNAPSHOT_OR_LABEL`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era snap` is the single user-facing "remember this state" command: it accepts an optional label and defaults to the current local timestamp formatted like `Jan 1, 2024 11:11:11`. `era status` compares the working tree to the current saved snapshot and reports whether changes are detected.
 
 ---
 
@@ -199,31 +199,30 @@ The user cannot lose work to forgotten commits. Their attention stays on the wor
 
 _Contrast with git:_ no `add`, no `commit`, no commit-message-for-every-change. Editor plugins that auto-commit on save approximate this but produce a noisy, unstructured history; here, density is the design, and the timeline UI handles presentation.
 
-### Marking a Meaningful Moment
+### Remembering a Meaningful Moment
 
-When the user finishes something they want to remember — a feature, a refactor, a known-good state before risky changes — they attach a label.
+When the user finishes something they want to remember — a feature, a refactor, a known-good state before risky changes — they use one command:
 
 ```
-vc mark "feature: cellular automata loading spinner"
+era snap "feature: cellular automata loading spinner"
 ```
 
-The label applies to the most recent snapshot, which already exists. In the timeline, labeled snapshots are the headlines; unlabeled ones are the fabric between them. The user can show or hide unlabeled snapshots when reviewing history.
+From the user's point of view, `era snap` means "make this current state easy to get back to." If the tree has not been saved yet, Era saves it and attaches the label. If the exact tree is already saved, Era can represent the label without making the user think about capture versus metadata. In the current implementation, this command creates a snapshot object with the current root tree and the supplied message, so the timeline shows the label as the headline.
 
-_Contrast with git:_ the closest analog to `git commit -m`, but the snapshot already exists — the label is metadata, not the act of capture.
+_Contrast with git:_ the closest analog is `git commit -m`, but there is no staging area and no separate `mark` command for users to learn.
 
 ### Going Back in Time
 
 The user wants the tree as it was an hour ago, or before yesterday's refactor, or at the labeled "feature complete" moment.
 
 ```
-vc at "1 hour ago"
-vc at "feature complete"
-vc restore src/foo.py at 2pm    # pull just one file from a past moment
+era restore "feature complete"
+era restore abc123def456
 ```
 
-Time travel is a primitive operation. The whole tree, or a single file, can be retrieved from any past snapshot. The user does not check out a commit and then remember to come back — they ask for what they want, and the working directory becomes that.
+Time travel is a primitive operation. The current implementation restores whole trees by exact label, unique snapshot ID prefix, or full snapshot ID. The user does not check out a commit and then remember to come back — they ask for what they want, and the working directory becomes that.
 
-Any in-progress work in the current state is already captured in the timeline as auto-snapshots, so nothing is lost by traveling.
+Before restore changes the working directory, Era saves any unsnapped current work, so nothing is lost by traveling.
 
 _Contrast with git:_ `reflog` and `checkout` exist for this with caveats — uncommitted work blocks switching, the reflog is technical and ephemeral, restoring a single file requires `git show <commit>:path > path`.
 
@@ -232,10 +231,10 @@ _Contrast with git:_ `reflog` and `checkout` exist for this with caveats — unc
 The user wants to try something risky without affecting their main line.
 
 ```
-vc branch try-new-approach
+era branch try-new-approach
 ```
 
-A branch is a named pointer to the current snapshot. Creating it is instantaneous and costs essentially nothing. The user works on the branch; auto-snapshots accumulate on it. If the experiment works, they merge. If not, they discard the branch — and even then, the work remains reachable through the timeline until garbage-collected.
+A branch is a named pointer to a saved snapshot. Creating it is instantaneous and costs essentially nothing; if the working tree has unsnapped changes, Era saves them first and then creates the branch at that saved state. The user works on the branch; snapshots accumulate on it. If the experiment works, they merge. If not, they discard the branch — and even then, the work remains reachable through the timeline until garbage-collected.
 
 _Contrast with git:_ `git checkout -b`, but without uncommitted changes blocking the switch and without the worktree/disk overhead of multiple branches existing simultaneously.
 
@@ -244,10 +243,10 @@ _Contrast with git:_ `git checkout -b`, but without uncommitted changes blocking
 The user is mid-task, gets pulled into something else, and needs to switch branches.
 
 ```
-vc switch main
+era switch main
 ```
 
-The current state — including any in-progress work — has already been auto-snapshotted on the current branch. Switching loses nothing. When the user returns later, they pick up exactly where they left off.
+Era saves the current state — including any in-progress work — on the current branch before materializing the target branch. Switching loses nothing. When the user returns later, they pick up exactly where they left off.
 
 _Contrast with git:_ no `git stash` dance, no "your local changes would be overwritten" error, no half-staged work caught between branches.
 
@@ -256,10 +255,10 @@ _Contrast with git:_ no `git stash` dance, no "your local changes would be overw
 The user wants to know what changed recently — in the last hour, since they last looked, or by a particular author.
 
 ```
-vc timeline                       # all snapshots, newest first
-vc timeline --labeled             # only the meaningful moments
-vc timeline --since "9am"
-vc timeline --by claude-sonnet
+era timeline                      # all snapshots, newest first
+era timeline --labeled            # only the meaningful moments
+era timeline --since "9am"
+era timeline --by claude-sonnet
 ```
 
 Provenance makes the last form possible. Every snapshot knows its author, including agents, and the timeline can be filtered on any provenance field.
@@ -271,7 +270,7 @@ _Contrast with git:_ `git log` exists, but author is a free-form string, and "ev
 A user (or another agent) spawns ten coding agents to attempt the same task in parallel. Each gets its own branch, forked from the current state.
 
 ```
-vc fanout agent-{1..10} from main
+era fanout agent-{1..10} from main
 ```
 
 Each agent works in its own materialized working directory (eventually, its own FUSE mount), reading and writing freely. Each write produces an auto-snapshot labeled with that agent's provenance. When the agents finish, the user reviews the resulting branches, picks the winner, merges it, and discards the rest.
@@ -284,7 +283,7 @@ _Contrast with git:_ `git worktree` and ten clones each cost real disk space and
 
 A script destroys half the files in the user's working directory. In git, any uncommitted work is lost and the user has to remember what was on disk.
 
-Here, every state was captured. The user runs `vc at "5 minutes ago"` and the working directory returns to before the disaster. The destructive script's effects remain in the timeline as snapshots the user can ignore or examine, but nothing is irrecoverable.
+Here, every state was captured. The user restores a snapshot from before the mistake and the working directory returns to before the disaster. The destructive script's effects remain in the timeline as snapshots the user can ignore or examine, but nothing is irrecoverable.
 
 _Contrast with git:_ hope you committed. If you didn't, you're using your editor's local history.
 

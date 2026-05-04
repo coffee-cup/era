@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand};
 use era_core::{ObjectId, Snapshot};
 use era_materialization::{CaptureIssueKind, CaptureStats, FilesystemMaterializer};
 use era_repository::{
-    BranchName, Repository, RepositoryError, SnapshotRequest, SnapshotResult, TimelineEntry,
+    BranchHead, BranchName, BranchOperationResult, Repository, RepositoryError, RestoreResult,
+    SnapshotRequest, SnapshotResult, SwitchResult, TimelineEntry, WorkingTreeStatus,
 };
 use std::{error::Error, fmt, path::PathBuf, process::ExitCode};
 use tracing_subscriber::EnvFilter;
@@ -39,8 +40,11 @@ enum Commands {
     Init,
     /// Capture a manual snapshot of the current repository.
     Snap {
-        /// Human-facing message attached to the snapshot. Defaults to the current local time.
-        #[arg(short, long)]
+        /// Human-facing label attached to the snapshot. Defaults to the current local time.
+        #[arg(value_name = "LABEL", conflicts_with = "message")]
+        label: Option<String>,
+        /// Human-facing label attached to the snapshot. Alias for the positional label.
+        #[arg(short, long, value_name = "MESSAGE")]
         message: Option<String>,
         /// Optional author recorded on the snapshot.
         #[arg(long)]
@@ -48,6 +52,21 @@ enum Commands {
     },
     /// Show the current repository state.
     Status,
+    /// List branches or create a branch at the current state.
+    Branch {
+        /// Branch name to create. Omit to list branches.
+        name: Option<String>,
+    },
+    /// Switch to an existing branch, saving current work first.
+    Switch {
+        /// Branch name to switch to.
+        name: String,
+    },
+    /// Restore a snapshot ID, unique prefix, or exact label into the working directory.
+    Restore {
+        /// Snapshot ID, unique ID prefix, or exact snapshot label.
+        target: String,
+    },
     /// Show the current branch timeline, newest snapshot first.
     Timeline,
 }
@@ -55,8 +74,15 @@ enum Commands {
 async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Commands::Init => init(cli.verbose).await,
-        Commands::Snap { message, author } => snap(message, author, cli.verbose).await,
+        Commands::Snap {
+            label,
+            message,
+            author,
+        } => snap(label, message, author, cli.verbose).await,
         Commands::Status => status(cli.verbose).await,
+        Commands::Branch { name } => branch(name, cli.verbose).await,
+        Commands::Switch { name } => switch(name, cli.verbose).await,
+        Commands::Restore { target } => restore(target, cli.verbose).await,
         Commands::Timeline => timeline(cli.verbose).await,
     }
 }
@@ -77,6 +103,7 @@ async fn init(verbose: bool) -> Result<(), CliError> {
 }
 
 async fn snap(
+    label: Option<String>,
     message: Option<String>,
     author: Option<String>,
     verbose: bool,
@@ -84,7 +111,7 @@ async fn snap(
     let materializer = FilesystemMaterializer::new();
     let repository = Repository::open(current_directory()?).await?;
     let branch = repository.current_branch().await?;
-    let message = message.unwrap_or_else(default_snapshot_message);
+    let message = message.or(label).unwrap_or_else(default_snapshot_message);
     let mut request = SnapshotRequest::manual(message);
     if let Some(author) = author {
         request = request.with_author(author);
@@ -98,21 +125,66 @@ async fn snap(
 }
 
 async fn status(verbose: bool) -> Result<(), CliError> {
+    let materializer = FilesystemMaterializer::new();
     let repository = Repository::open(current_directory()?).await?;
     let branch = repository.current_branch().await?;
     let timeline = repository.timeline().await?;
-    let current = timeline.first().ok_or(CliError::EmptyTimeline)?;
+    if timeline.is_empty() {
+        return Err(CliError::EmptyTimeline);
+    }
+    let status = repository.working_tree_status(&materializer).await?;
     let branch_ref = repository.current_branch_ref_path().await?;
 
     print_status(
         &repository,
         &branch,
-        current.snapshot_id,
-        &current.snapshot,
+        &status,
         timeline.len(),
         verbose,
         &branch_ref,
     );
+    print_scan_warnings(&status.scan.issues);
+    Ok(())
+}
+
+async fn branch(name: Option<String>, verbose: bool) -> Result<(), CliError> {
+    let materializer = FilesystemMaterializer::new();
+    let repository = Repository::open(current_directory()?).await?;
+
+    match name {
+        Some(name) => {
+            let branch = BranchName::new(name).map_err(RepositoryError::from)?;
+            let result = repository.create_branch(&materializer, branch).await?;
+            print_branch_created(&result, verbose);
+            print_optional_saved_warnings(result.saved_snapshot.as_ref());
+        }
+        None => {
+            let branches = repository.branches().await?;
+            print_branches(&branches, verbose);
+        }
+    }
+
+    Ok(())
+}
+
+async fn switch(name: String, verbose: bool) -> Result<(), CliError> {
+    let materializer = FilesystemMaterializer::new();
+    let repository = Repository::open(current_directory()?).await?;
+    let branch = BranchName::new(name).map_err(RepositoryError::from)?;
+    let result = repository.switch_branch(&materializer, branch).await?;
+
+    print_switch_result(&result, verbose);
+    print_optional_saved_warnings(result.saved_snapshot.as_ref());
+    Ok(())
+}
+
+async fn restore(target: String, verbose: bool) -> Result<(), CliError> {
+    let materializer = FilesystemMaterializer::new();
+    let repository = Repository::open(current_directory()?).await?;
+    let result = repository.restore(&materializer, &target).await?;
+
+    print_restore_result(&result, verbose);
+    print_optional_saved_warnings(result.saved_snapshot.as_ref());
     Ok(())
 }
 
@@ -221,20 +293,25 @@ fn print_detail(label: &str, value: impl fmt::Display) {
 fn print_status(
     repository: &Repository,
     branch: &BranchName,
-    snapshot_id: ObjectId,
-    snapshot: &Snapshot,
+    status: &WorkingTreeStatus,
     timeline_len: usize,
     verbose: bool,
     branch_ref: &std::path::Path,
 ) {
     print_success_heading("Repository status");
+    let snapshot = &status.snapshot;
     print_field("Branch", branch);
-    print_field("Snapshot", styled(accent_style(), short_id(snapshot_id)));
-    print_field("Timeline", pluralize(timeline_len, "snapshot", "snapshots"));
     print_field(
-        "Working",
-        "not compared yet; run `era snap` to capture changes",
+        "Snapshot",
+        styled(accent_style(), short_id(status.snapshot_id)),
     );
+    print_field("Timeline", pluralize(timeline_len, "snapshot", "snapshots"));
+    let working = if status.is_clean() {
+        "no changes"
+    } else {
+        "changes detected; run `era snap` to save"
+    };
+    print_field("Working", working);
 
     if let Some(message) = snapshot.message() {
         print_field("Message", message);
@@ -248,8 +325,9 @@ fn print_status(
         print_detail("Objects", repository.object_store().root().display());
         print_detail("HEAD", repository.head_path().display());
         print_detail("Branch ref", branch_ref.display());
-        print_detail("Full snapshot", snapshot_id);
+        print_detail("Full snapshot", status.snapshot_id);
         print_detail("Root tree", snapshot.root_tree_id());
+        print_detail("Current tree", status.current_root_tree_id);
         print_detail("Timestamp", format!("{} ms", snapshot.timestamp_millis()));
         print_detail("Parents", snapshot.parents().len());
         print_detail("Source", snapshot.provenance().source());
@@ -257,11 +335,114 @@ fn print_status(
         if let Some(author) = snapshot.author() {
             print_detail("Author", author);
         }
+
+        let stats = &status.scan.stats;
+        print_detail("Files", stats.files_seen);
+        print_detail("Directories", stats.directories_seen);
+        print_detail("Bytes", stats.bytes_read);
+        print_detail("Ignored", stats.ignored_entries);
+        print_detail("Symlinks", stats.symlinks_skipped);
+    }
+}
+
+fn print_branch_created(result: &BranchOperationResult, verbose: bool) {
+    print_success_heading("Created branch");
+    print_field("Branch", &result.branch);
+    print_field(
+        "Snapshot",
+        styled(accent_style(), short_id(result.snapshot_id)),
+    );
+
+    if verbose {
+        print_optional_saved_snapshot(result.saved_snapshot.as_ref());
+    }
+}
+
+fn print_branches(branches: &[BranchHead], verbose: bool) {
+    anstream::println!("Branches");
+    for branch in branches {
+        let marker = if branch.is_current { "*" } else { " " };
+        let name = if branch.is_current {
+            styled(accent_style(), &branch.name)
+        } else {
+            branch.name.to_string()
+        };
+        anstream::println!(
+            "{marker} {name} {}",
+            styled(accent_style(), short_id(branch.snapshot_id))
+        );
+
+        if verbose {
+            print_indented_detail("Full snapshot", branch.snapshot_id);
+        }
+    }
+}
+
+fn print_switch_result(result: &SwitchResult, verbose: bool) {
+    print_success_heading("Switched branch");
+    print_field("Branch", &result.branch);
+    print_field(
+        "Snapshot",
+        styled(accent_style(), short_id(result.snapshot_id)),
+    );
+
+    if let Some(message) = result.snapshot.message() {
+        print_field("Message", message);
+    }
+
+    if verbose {
+        print_materialize_details(&result.materialization);
+        print_optional_saved_snapshot(result.saved_snapshot.as_ref());
+    }
+}
+
+fn print_restore_result(result: &RestoreResult, verbose: bool) {
+    print_success_heading("Restored snapshot");
+    print_field(
+        "Snapshot",
+        styled(accent_style(), short_id(result.snapshot_id)),
+    );
+
+    if let Some(message) = result.snapshot.message() {
+        print_field("Message", message);
+    }
+
+    if verbose {
+        print_materialize_details(&result.materialization);
+        print_optional_saved_snapshot(result.saved_snapshot.as_ref());
+    }
+}
+
+fn print_materialize_details(result: &era_materialization::MaterializeResult) {
+    anstream::println!();
+    print_section("Materialized");
+    print_detail("Files written", result.stats.files_written);
+    print_detail("Dirs created", result.stats.directories_created);
+    print_detail("Entries removed", result.stats.entries_removed);
+    print_detail("Bytes written", result.stats.bytes_written);
+}
+
+fn print_optional_saved_snapshot(saved: Option<&SnapshotResult>) {
+    if let Some(saved) = saved {
+        anstream::println!();
+        print_section("Saved current work");
+        print_detail("Snapshot", saved.snapshot_id);
+        print_detail("Root tree", saved.snapshot.root_tree_id());
+    }
+}
+
+fn print_optional_saved_warnings(saved: Option<&SnapshotResult>) {
+    if let Some(saved) = saved {
+        print_capture_warnings(saved);
     }
 }
 
 fn print_capture_warnings(result: &SnapshotResult) {
-    for issue in &result.capture.issues {
+    print_scan_warnings(&result.capture.issues);
+}
+
+fn print_scan_warnings(issues: &[era_materialization::CaptureIssue]) {
+    for issue in issues {
         let description = match issue.kind {
             CaptureIssueKind::SkippedSymlink => "skipped symlink",
         };
@@ -312,6 +493,7 @@ fn timeline_title(snapshot: &Snapshot) -> String {
     match snapshot.message() {
         Some(message) if !message.is_empty() => message.to_owned(),
         _ if snapshot.provenance().source() == "repository-init" => "repository init".to_owned(),
+        _ if snapshot.provenance().source() == "auto-snapshot" => "auto snapshot".to_owned(),
         _ => snapshot.provenance().source().to_owned(),
     }
 }

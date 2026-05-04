@@ -6,8 +6,8 @@ mod filesystem;
 mod working_directory;
 
 pub use capture::{
-    CaptureIssue, CaptureIssueKind, CaptureOptions, CaptureResult, CaptureStats, Materializer,
-    SymlinkPolicy,
+    CaptureIssue, CaptureIssueKind, CaptureOptions, CaptureResult, CaptureStats, MaterializeResult,
+    MaterializeStats, Materializer, SymlinkPolicy, TreeScanResult, TreeScanStats,
 };
 pub use error::MaterializationError;
 pub use filesystem::FilesystemMaterializer;
