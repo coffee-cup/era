@@ -1,5 +1,6 @@
 use era_core::TreeError;
 use era_object_store::ObjectStoreError;
+use notify::Error as NotifyError;
 use std::{error::Error, fmt, io, path::PathBuf};
 
 /// Errors returned while scanning or materializing a working directory.
@@ -11,6 +12,8 @@ pub enum MaterializationError {
     RootNotDirectory { path: PathBuf },
     /// A filesystem operation failed.
     Io { path: PathBuf, source: io::Error },
+    /// A filesystem watcher operation failed.
+    Watch { path: PathBuf, source: NotifyError },
     /// A path segment could not be represented as UTF-8.
     PathNotUtf8 { path: PathBuf },
     /// A filesystem entry cannot be represented in the current tree model.
@@ -45,6 +48,13 @@ impl fmt::Display for MaterializationError {
                     path.display()
                 )
             }
+            Self::Watch { path, source } => {
+                write!(
+                    formatter,
+                    "filesystem watch error at {}: {source}",
+                    path.display()
+                )
+            }
             Self::PathNotUtf8 { path } => write!(
                 formatter,
                 "path contains a non-UTF-8 segment and cannot be captured: {}",
@@ -74,6 +84,7 @@ impl Error for MaterializationError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
+            Self::Watch { source, .. } => Some(source),
             Self::InvalidTreeEntry { source, .. } => Some(source),
             Self::ObjectStore { source } => Some(source),
             Self::RootMissing { .. }

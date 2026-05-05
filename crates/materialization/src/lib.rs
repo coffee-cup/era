@@ -3,6 +3,8 @@
 mod capture;
 mod error;
 mod filesystem;
+mod hash_cache;
+mod watch;
 mod working_directory;
 
 pub use capture::{
@@ -12,6 +14,7 @@ pub use capture::{
 };
 pub use error::MaterializationError;
 pub use filesystem::FilesystemMaterializer;
+pub use watch::{WatchEvent, WorkingDirectoryWatch};
 pub use working_directory::WorkingDirectory;
 
 #[cfg(test)]

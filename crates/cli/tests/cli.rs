@@ -190,6 +190,11 @@ fn snap_status_and_timeline_report_missing_repository_error() -> Result<(), Box<
     assert_no_ansi(&restore_stderr);
     assert!(restore_stderr.contains("error: not an Era repository:"));
 
+    let watch = era(work).args(["watch", "--once"]).assert().failure();
+    let watch_stderr = output_text(&watch.get_output().stderr)?;
+    assert_no_ansi(&watch_stderr);
+    assert!(watch_stderr.contains("error: not an Era repository:"));
+
     Ok(())
 }
 
@@ -217,6 +222,58 @@ fn status_detects_changes_and_snap_makes_it_clean() -> Result<(), Box<dyn Error>
     let timeline = era(work).arg("timeline").assert().success();
     let timeline_stdout = output_text(&timeline.get_output().stdout)?;
     assert!(timeline_stdout.contains("remember this"));
+    Ok(())
+}
+
+#[test]
+fn watch_once_saves_dirty_work_as_unlabeled_auto_snapshot() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
+    era(work).arg("init").assert().success();
+
+    fs::write(work.join("README.md"), b"two")?;
+    let watch = era(work)
+        .args([
+            "--verbose",
+            "watch",
+            "--once",
+            "--workspace",
+            "agent-1",
+            "--agent",
+            "claude",
+            "--task",
+            "fix-parser",
+            "--model",
+            "sonnet",
+        ])
+        .assert()
+        .success();
+    let watch_stdout = output_text(&watch.get_output().stdout)?;
+    assert_no_ansi(&watch_stdout);
+    assert!(watch_stdout.starts_with("Saved auto snapshot "));
+    let watch_lines = lines(&watch_stdout);
+    let saved_snapshot = watch_lines[0]
+        .strip_prefix("Saved auto snapshot ")
+        .expect("watch output should include saved snapshot ID");
+    assert_short_object_id(saved_snapshot);
+    assert_eq!(field_line_value(&watch_stdout, "Source"), "auto-snapshot");
+    assert_eq!(field_line_value(&watch_stdout, "trigger"), "reconcile");
+    assert_eq!(field_line_value(&watch_stdout, "workspace"), "agent-1");
+    assert_eq!(field_line_value(&watch_stdout, "agent"), "claude");
+    assert_eq!(field_line_value(&watch_stdout, "task"), "fix-parser");
+    assert_eq!(field_line_value(&watch_stdout, "model"), "sonnet");
+
+    let status = era(work).arg("status").assert().success();
+    let status_stdout = output_text(&status.get_output().stdout)?;
+    assert_eq!(field_line_value(&status_stdout, "Working"), "no changes");
+
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+    let timeline_lines = lines(&timeline_stdout);
+    assert_eq!(timeline_lines[0], "Timeline for main");
+    assert!(timeline_lines[1].starts_with(&format!("● {saved_snapshot}  auto snapshot · ")));
+
     Ok(())
 }
 

@@ -37,3 +37,11 @@ If Rust is not installed, run `mise install` first.
 - Prefer clear component boundaries over premature abstraction.
 - Add or update tests for behavior changes.
 - Keep documentation current when public commands, workspace structure, or architectural responsibilities change.
+- Don't let technical details get in the way of user experience. Always consider how the user or agent will interact with the system.
+
+## Agent and workspace design notes
+
+- Treat a workspace as the per-directory execution context for a human or agent: materialized path, watcher/debounce state, hash cache, current checkout context, and workspace ID.
+- Keep shared repository state limited to objects, refs, snapshot graph, and future indexes. Do not put per-workspace watcher/cache state in the shared object store.
+- Automatic snapshots should remain unlabeled; use structured provenance attributes such as `trigger`, `workspace`, `agent`, `task`, and `model` for auditability.
+- Preserve the path toward thousands of agent workspaces by keeping materialization APIs path-oriented and avoiding assumptions that one repository has exactly one working directory forever.

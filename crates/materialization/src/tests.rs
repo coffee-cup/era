@@ -95,6 +95,7 @@ async fn captures_nested_files_and_empty_directories() {
             bytes_read: (readme.len() + main_rs.len() + lib_rs.len()) as u64,
             blobs_stored: 3,
             trees_stored: 3,
+            hash_cache_misses: 3,
             ..CaptureStats::default()
         }
     );
@@ -237,6 +238,43 @@ async fn scan_tree_matches_capture_without_storing_objects() {
     assert_eq!(scan.stats.ignored_entries, capture.stats.ignored_entries);
     assert_eq!(scan.stats.symlinks_skipped, capture.stats.symlinks_skipped);
     assert_eq!(scan.issues, capture.issues);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hash_cache_reuses_unchanged_files_and_can_be_invalidated() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"hello").await.unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+
+    let first = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    let second = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert_eq!(second.root_tree_id, first.root_tree_id);
+    assert_eq!(first.stats.hash_cache_misses, 1);
+    assert_eq!(first.stats.hash_cache_hits, 0);
+    assert_eq!(second.stats.hash_cache_hits, 1);
+    assert_eq!(second.stats.hash_cache_misses, 0);
+    assert_eq!(second.stats.bytes_read, 0);
+    assert_eq!(second.stats.blobs_stored, 0);
+
+    materializer.invalidate_paths([PathBuf::from("README.md")]);
+    let third = materializer
+        .scan_tree(&WorkingDirectory::new(&work))
+        .await
+        .unwrap();
+
+    assert_eq!(third.root_tree_id, first.root_tree_id);
+    assert_eq!(third.stats.hash_cache_hits, 0);
+    assert_eq!(third.stats.hash_cache_misses, 1);
+    assert_eq!(third.stats.bytes_read, 5);
 }
 
 #[tokio::test(flavor = "current_thread")]

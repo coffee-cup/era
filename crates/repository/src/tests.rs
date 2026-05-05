@@ -259,6 +259,91 @@ async fn working_tree_status_detects_clean_and_dirty_states() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn snapshot_if_changed_skips_clean_trees_and_records_auto_provenance() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+
+    let clean = repo
+        .snapshot_if_changed(
+            &materializer,
+            SnapshotRequest::automatic_for_trigger(AutoSnapshotTrigger::Reconcile)
+                .with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+    assert!(clean.is_none());
+    assert_eq!(
+        repo.current_snapshot_id().await.unwrap(),
+        init.snapshot.snapshot_id
+    );
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let saved = repo
+        .snapshot_if_changed(
+            &materializer,
+            SnapshotRequest::automatic_for_trigger(AutoSnapshotTrigger::Watch)
+                .with_timestamp_millis(3)
+                .with_provenance_attribute("workspace", "agent-1")
+                .with_provenance_attribute("agent", "claude")
+                .with_provenance_attribute("task", "fix-parser"),
+        )
+        .await
+        .unwrap()
+        .expect("dirty tree should be saved");
+
+    assert_eq!(repo.current_snapshot_id().await.unwrap(), saved.snapshot_id);
+    assert_eq!(saved.snapshot.parents(), &[init.snapshot.snapshot_id]);
+    assert_eq!(saved.snapshot.message(), None);
+    assert_eq!(saved.snapshot.provenance().source(), "auto-snapshot");
+    assert_eq!(
+        saved
+            .snapshot
+            .provenance()
+            .attributes()
+            .get("trigger")
+            .map(String::as_str),
+        Some("watch")
+    );
+    assert_eq!(
+        saved
+            .snapshot
+            .provenance()
+            .attributes()
+            .get("workspace")
+            .map(String::as_str),
+        Some("agent-1")
+    );
+    assert_eq!(
+        saved
+            .snapshot
+            .provenance()
+            .attributes()
+            .get("agent")
+            .map(String::as_str),
+        Some("claude")
+    );
+    assert_eq!(
+        saved
+            .snapshot
+            .provenance()
+            .attributes()
+            .get("task")
+            .map(String::as_str),
+        Some("fix-parser")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn branch_create_switch_and_restore_cover_local_workflows() {
     let temp = TempDir::new().unwrap();
     let work = create_workdir(&temp).await;

@@ -112,7 +112,7 @@ Responsibilities:
 
 In v0, materialization works by ordinary file operations — copying bytes from the object store onto the filesystem, walking the working tree to detect changes, and using a platform-appropriate filesystem watcher to observe writes. The materialization API should still be async and capability-oriented from the start, so repository code does not depend on the copy-based implementation detail.
 
-The current implementation covers both directions for local workflows. `FilesystemMaterializer` can capture a working directory into blob/tree objects, scan a working directory without storing objects to compute the tree ID that status compares, compare a working directory with a stored tree to produce path-level added/modified/deleted/type-changed status entries, and materialize a stored tree back into the working directory for branch switching and restore. Capture, scan, and compare use configurable exact directory-name exclusions; defaults skip Era metadata, Git metadata, and common generated/transient directories such as `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`. Symlinks are not followed; by default they are skipped and reported, and callers can choose an error policy instead. Materialization preserves excluded directories that are outside the target tree, including `.era`, so repository metadata and generated caches are not deleted during restore.
+The current implementation covers both directions for local workflows. `FilesystemMaterializer` can capture a working directory into blob/tree objects, scan a working directory without storing objects to compute the tree ID that status compares, compare a working directory with a stored tree to produce path-level added/modified/deleted/type-changed status entries, watch a working directory for filesystem change hints, and materialize a stored tree back into the working directory for branch switching and restore. Capture, scan, and compare use a per-materializer in-memory hash cache so a long-running watcher can reuse unchanged file hashes. Capture, scan, compare, and watch filtering use configurable exact directory-name exclusions; defaults skip Era metadata, Git metadata, and common generated/transient directories such as `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`. Symlinks are not followed; by default they are skipped and reported, and callers can choose an error policy instead. Materialization preserves excluded directories that are outside the target tree, including `.era`, so repository metadata and generated caches are not deleted during restore.
 
 This layer is intentionally a replaceable component. Future implementations (hardlink-based, reflink-based, FUSE-based) will plug in here without changing anything above. The interface this layer presents to the repository is small and stable: "checkout this snapshot at this path," "what does this path look like now," "tell me when something changes."
 
@@ -127,7 +127,7 @@ Responsibilities:
 - Implement higher-level operations: diff between snapshots, walk history, merge branches
 - Apply tracking heuristics: decide which files should and should not be part of snapshots
 
-The current repository implementation covers local init, open, manual snapshots, first-parent timeline walking, path-aware working-tree status comparison, branch listing/creation/switching, and whole-tree restore. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Manual snapshots capture the current tree, store a snapshot with the current branch tip as parent, and advance the branch ref. Status compares the working tree to the current branch snapshot and reports the root tree comparison plus sorted path-level changes. Branch creation writes another ref pointing at the current saved snapshot. Switching branches and restoring snapshots save unsnapped work first, then ask the materializer to reconcile the working directory. Restore materializes a target snapshot without moving the current branch ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
+The current repository implementation covers local init, open, manual snapshots, changed-only automatic snapshots, first-parent timeline walking, path-aware working-tree status comparison, branch listing/creation/switching, and whole-tree restore. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Manual snapshots capture the current tree, store a snapshot with the current branch tip as parent, and advance the branch ref. Automatic snapshot requests capture the current tree and advance the branch only when the root tree differs from the current snapshot, avoiding duplicate history entries. Status compares the working tree to the current branch snapshot and reports the root tree comparison plus sorted path-level changes. Branch creation writes another ref pointing at the current saved snapshot. Switching branches and restoring snapshots save unsnapped work first, then ask the materializer to reconcile the working directory. Restore materializes a target snapshot without moving the current branch ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
 
 The repository is where intelligence lives. It is also where most of the v0 design space is, because the rules for "when do we snapshot, what do we include, how do we merge" are precisely what differentiates this system from git.
 
@@ -137,7 +137,7 @@ The user-facing surface. A thin layer that translates user intent into repositor
 
 The library API is the primary interface; the CLI is a thin shell over it. This ordering matters: the library should be usable directly from agent harnesses, editor plugins, and other tooling without going through a subprocess. Agents are first-class clients.
 
-The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap`, `era snap "label"`, `era snap --message "..."`, `era status`, `era branch`, `era branch NAME`, `era switch NAME`, `era restore SNAPSHOT_OR_LABEL`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era snap` is the single user-facing "remember this state" command: it accepts an optional label and defaults to the current local timestamp formatted like `Jan 1, 2024 11:11:11`. `era status` compares the working tree to the current saved snapshot, reports whether changes are detected, and lists changed paths with `A`, `M`, `D`, or `T` markers when dirty.
+The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap`, `era snap "label"`, `era snap --message "..."`, `era status`, `era branch`, `era branch NAME`, `era switch NAME`, `era restore SNAPSHOT_OR_LABEL`, `era watch`, `era watch --once`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era snap` is the single user-facing "remember this state" command: it accepts an optional label and defaults to the current local timestamp formatted like `Jan 1, 2024 11:11:11`. `era status` compares the working tree to the current saved snapshot, reports whether changes are detected, and lists changed paths with `A`, `M`, `D`, or `T` markers when dirty. `era watch` runs in the foreground, debounces filesystem events, periodically reconciles the full tree, and creates unlabeled automatic snapshots when the tree changed. Watch snapshots use structured provenance attributes for `trigger`, `workspace`, and optional agent/task/model fields; the timestamp shown in timeline output is a display title, not a stored label.
 
 ---
 
@@ -149,13 +149,15 @@ Naively, capturing a snapshot means hashing every file in the working tree. For 
 
 The system maintains a per-file hash cache keyed on stable filesystem identifiers — typically the inode, file size, and modification time. If those have not changed since the file was last hashed, the cached hash is reused. Snapshotting an unchanged 10GB tree should take milliseconds, not seconds.
 
+The current implementation has a per-materializer in-memory hash cache. That makes long-running `era watch` sessions cheap after the first capture and keeps cache state naturally scoped to a single workspace. A persistent cache under repository/workspace metadata remains future work and should preserve that same boundary: shared object stores are global, but hash caches belong to materialized workspaces.
+
 This cache is the single most important performance component in the system. Without it, "fast" is impossible.
 
 ### Filesystem Watching
 
-The auto-snapshot model requires knowing when the working directory has changed. The materialization layer watches the working directory using platform-native facilities (fanotify or inotify on Linux, FSEvents on macOS) and emits change events upward.
+The auto-snapshot model requires knowing when the working directory has changed. The materialization layer watches the working directory using platform-native facilities and emits change events upward.
 
-Watchers are imperfect: events can be lost, coalesced, or duplicated, and edge cases differ across platforms. The repository layer treats watcher events as hints, not ground truth — a periodic reconciliation pass walks the working tree to confirm what the watcher reported (using the hash cache to keep this cheap).
+The current user-facing form is foreground `era watch`, not a daemon started by `era init`. It debounces watcher events, invalidates affected hash-cache entries, and periodically reconciles the full working tree to catch missed events. Watchers are imperfect: events can be lost, coalesced, or duplicated, and edge cases differ across platforms. The repository layer treats watcher events as hints, not ground truth — reconciliation still walks the working tree to confirm what changed, using the hash cache to keep this cheap.
 
 ### Intelligent Tracking
 
@@ -185,7 +187,7 @@ How the system actually feels to use, contrasted with git where instructive. The
 
 ### Starting Work on a Project
 
-A user runs an init command in a directory. The system creates a hidden metadata directory, takes an initial snapshot of whatever is already there, and begins watching for changes. From this moment on, every meaningful change is captured automatically.
+A user runs an init command in a directory. The system creates a hidden metadata directory and takes an initial snapshot of whatever is already there. In the current implementation, the user then runs `era watch` when they want foreground automatic snapshots; a future daemon can make watching implicit after init.
 
 There is no equivalent to `git add` for telling the system which files matter. The intelligent tracking layer decides, with an optional repository-local override file for cases where the heuristics get it wrong.
 
@@ -193,7 +195,7 @@ _Contrast with git:_ no separate init, add, and commit ceremony. One step, and t
 
 ### Day-to-Day Editing
 
-The user edits files. The system observes. After a brief debounce window of inactivity, an unlabeled snapshot is taken automatically. The user runs no command; the snapshot just appears in the timeline.
+The user edits files while `era watch` is running. The system observes. After a brief debounce window of inactivity, an unlabeled snapshot is taken automatically. The user runs no per-change command; the snapshot just appears in the timeline.
 
 The user cannot lose work to forgotten commits. Their attention stays on the work, not on version-control hygiene. A dense history accumulates in the background, and tooling decides how much of it to surface.
 
@@ -273,9 +275,11 @@ A user (or another agent) spawns ten coding agents to attempt the same task in p
 era fanout agent-{1..10} from main
 ```
 
-Each agent works in its own materialized working directory (eventually, its own FUSE mount), reading and writing freely. Each write produces an auto-snapshot labeled with that agent's provenance. When the agents finish, the user reviews the resulting branches, picks the winner, merges it, and discards the rest.
+Each agent works in its own materialized workspace (eventually, its own FUSE mount), reading and writing freely. Each write produces an unlabeled auto-snapshot with structured provenance for the workspace, agent, model, and task. When the agents finish, the user reviews the resulting branches, picks the winner, merges it, and discards the rest.
 
 The total storage cost is dominated by the actual changes the agents made — typically kilobytes each — not by ten copies of the repository. This is the model that makes agent-scale parallelism economical.
+
+The architecture uses **workspace** for the per-directory execution context. A shared repository owns object storage, refs, and the snapshot graph. Each workspace owns a materialized path, its watcher/debounce loop, hash cache, current checkout context, and workspace ID. The current CLI records `workspace=default` unless `era watch --workspace ...` overrides it; future multi-workspace commands should keep this boundary instead of putting per-workspace state in the shared object store.
 
 _Contrast with git:_ `git worktree` and ten clones each cost real disk space and real I/O. Fleets at this scale aren't practical in git's model.
 
@@ -304,7 +308,7 @@ To make the layers concrete, here is what happens when a file changes:
 1. **An editor (or agent) writes to a file** in the working directory.
 2. **The materialization layer's watcher** observes the write and emits a change event.
 3. **The repository layer** debounces a series of such events and decides a snapshot is warranted.
-4. **The repository asks the materializer** to compute the current tree state. The materializer walks the working directory, using the hash cache to skip unchanged files once that cache exists.
+4. **The repository asks the materializer** to compute the current tree state. The materializer walks the working directory, using the hash cache to skip unchanged files during long-running watch sessions.
 5. **For any file whose hash is new**, the materializer hands the bytes to the object store, which stores them and returns a hash. (Most files are unchanged and produce no new objects.)
 6. **The materializer builds tree objects** from the bottom up, again writing only new trees to the object store. Most trees are reused from the previous snapshot.
 7. **The repository builds a snapshot object** referencing the new root tree, the previous snapshot as its parent, the current timestamp, and any provenance supplied by the agent or user.
@@ -326,7 +330,7 @@ These are real and important problems that v0 explicitly does not solve, in serv
 - **Capability-based access control.** Agents and humans share the same store; isolation is a future concern.
 - **Syntax-aware merge.** v0 does file-level three-way merge with structured conflicts. Tree-sitter-based AST-aware merge is the obvious v1 wedge but is a substantial subsystem in its own right.
 - **Git interoperability.** v0 stands alone. Importing from and exporting to git repositories is well-defined but tedious work and is deferred.
-- **Multiple working directories from one repository.** v0 assumes one working directory per repository. The architecture does not preclude many — the materialization interface takes a path as a parameter for exactly this reason — but the workflows aren't built out yet.
+- **Multiple working directories from one repository.** v0 still opens one working directory at a time from the CLI. The architecture now treats each materialized directory as a future workspace with its own watcher and hash cache, but commands for registering, listing, and supervising many workspaces are not built out yet.
 
 ---
 

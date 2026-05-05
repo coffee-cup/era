@@ -9,8 +9,9 @@ pub use branch::{BranchName, InvalidBranchName, InvalidBranchNameReason};
 pub use era_materialization::{TreeChange, TreeChangeKind};
 pub use error::RepositoryError;
 pub use repository::{
-    BranchHead, BranchOperationResult, InitResult, Repository, ResolvedSnapshot, RestoreResult,
-    SnapshotRequest, SnapshotResult, SwitchResult, TimelineEntry, WorkingTreeStatus,
+    AutoSnapshotTrigger, BranchHead, BranchOperationResult, DEFAULT_WORKSPACE_ID, InitResult,
+    Repository, ResolvedSnapshot, RestoreResult, SnapshotRequest, SnapshotResult, SwitchResult,
+    TimelineEntry, WorkingTreeStatus,
 };
 
 #[cfg(test)]

@@ -1,8 +1,11 @@
-use crate::{MaterializationError, WorkingDirectory};
+use crate::{MaterializationError, WorkingDirectory, WorkingDirectoryWatch};
 use async_trait::async_trait;
 use era_core::ObjectId;
 use era_object_store::ObjectStore;
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Component, Path, PathBuf},
+};
 
 const DEFAULT_EXCLUDED_DIRECTORY_NAMES: &[&str] = &[
     ".era",
@@ -47,6 +50,12 @@ pub trait Materializer: Send + Sync {
         working_directory: &WorkingDirectory,
         object_store: &dyn ObjectStore,
     ) -> Result<MaterializeResult, MaterializationError>;
+
+    /// Watches a working directory and emits filesystem change hints.
+    async fn watch(
+        &self,
+        working_directory: &WorkingDirectory,
+    ) -> Result<WorkingDirectoryWatch, MaterializationError>;
 }
 
 /// Configuration for scanning a working directory.
@@ -76,6 +85,17 @@ impl CaptureOptions {
     #[must_use]
     pub fn excludes_directory_name(&self, name: &str) -> bool {
         self.excluded_directory_names.contains(name)
+    }
+
+    /// Returns `true` if any path segment matches an excluded directory name.
+    #[must_use]
+    pub fn excludes_path(&self, path: &Path) -> bool {
+        path.components().any(|component| match component {
+            Component::Normal(name) => name
+                .to_str()
+                .is_some_and(|name| self.excludes_directory_name(name)),
+            _ => false,
+        })
     }
 
     /// Adds an exact directory name to skip during capture.
@@ -282,6 +302,10 @@ pub struct TreeScanStats {
     pub ignored_entries: usize,
     /// Symlink entries skipped by [`SymlinkPolicy::Skip`].
     pub symlinks_skipped: usize,
+    /// File hashes reused from the in-memory hash cache.
+    pub hash_cache_hits: usize,
+    /// File hashes read from disk because no reusable cache entry existed.
+    pub hash_cache_misses: usize,
 }
 
 /// Result of materializing a stored tree into a working directory.
@@ -329,6 +353,10 @@ pub struct CaptureStats {
     pub ignored_entries: usize,
     /// Symlink entries skipped by [`SymlinkPolicy::Skip`].
     pub symlinks_skipped: usize,
+    /// File hashes reused from the in-memory hash cache.
+    pub hash_cache_hits: usize,
+    /// File hashes read from disk because no reusable cache entry existed.
+    pub hash_cache_misses: usize,
 }
 
 /// A non-fatal capture issue.

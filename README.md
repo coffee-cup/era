@@ -15,7 +15,7 @@ The v0 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.
 
 ## Current status
 
-The implemented foundation now covers content-addressed objects, working-directory capture/restore, repository snapshots, local branch workflows, path-aware status, and initial CLI workflows: BLAKE3 object IDs plus deterministic tree/snapshot types in `era-core`, an async local blob/tree/snapshot store in `era-object-store`, a configurable filesystem materializer in `era-materialization`, repository init/snapshot/status/branch/restore APIs in `era-repository`, and a thin `era` CLI over those APIs. CLI workflow expansion is tracked in [`docs/PLAN.md`](docs/PLAN.md).
+The implemented foundation now covers content-addressed objects, working-directory capture/restore, repository snapshots, local branch workflows, path-aware status, foreground auto-snapshot watching, and initial CLI workflows: BLAKE3 object IDs plus deterministic tree/snapshot types in `era-core`, an async local blob/tree/snapshot store in `era-object-store`, a configurable filesystem materializer with an in-memory hash cache in `era-materialization`, repository init/snapshot/status/branch/restore/auto-snapshot APIs in `era-repository`, and a thin `era` CLI over those APIs. CLI workflow expansion is tracked in [`docs/PLAN.md`](docs/PLAN.md).
 
 ## Prerequisites
 
@@ -39,10 +39,13 @@ era branch
 era branch experiment
 era switch experiment
 era restore "manual checkpoint"
+era watch
+era watch --once
+era watch --workspace agent-1 --agent claude --task fix-parser --model sonnet
 era timeline
 ```
 
-`era snap` captures the current state and attaches a human-facing label. If no label is supplied, Era uses the current local timestamp in the form `Jan 1, 2024 11:11:11`. `era status` reports whether the working tree matches the current saved snapshot and lists added, modified, deleted, and type-changed paths when it does not. `era branch` lists or creates branches, `era switch` saves current work before switching branches, and `era restore` saves current work before restoring a snapshot ID, unique ID prefix, or exact snapshot label. Use `--verbose` on any command for full object IDs, root tree IDs, timestamps, paths, and capture/materialization stats:
+`era snap` captures the current state and attaches a human-facing label. If no label is supplied, Era uses the current local timestamp in the form `Jan 1, 2024 11:11:11`. `era status` reports whether the working tree matches the current saved snapshot and lists added, modified, deleted, and type-changed paths when it does not. `era branch` lists or creates branches, `era switch` saves current work before switching branches, and `era restore` saves current work before restoring a snapshot ID, unique ID prefix, or exact snapshot label. `era watch` runs in the foreground, treats filesystem events as hints, debounces edits, periodically reconciles the full tree, and creates unlabeled automatic snapshots only when the tree changed. Watch snapshots record structured provenance such as trigger, workspace, agent, task, and model; the timeline renders their timestamp as a synthetic title instead of storing a label. Use `--verbose` on any command for full object IDs, root tree IDs, timestamps, paths, provenance attributes, and capture/materialization/cache stats:
 
 ```sh
 era --verbose status

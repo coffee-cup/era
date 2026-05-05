@@ -22,6 +22,9 @@ use std::{
 use tokio::fs;
 use tracing::{debug, trace};
 
+/// Workspace ID used until repositories support multiple registered workspaces.
+pub const DEFAULT_WORKSPACE_ID: &str = "default";
+
 /// A local Era repository rooted at a working directory.
 #[derive(Debug, Clone)]
 pub struct Repository {
@@ -124,6 +127,28 @@ impl Repository {
 
         debug!(branch = branch.as_str(), %snapshot.snapshot_id, "advanced branch ref");
         Ok(snapshot)
+    }
+
+    /// Captures and advances the current branch only when the working tree changed.
+    pub async fn snapshot_if_changed(
+        &self,
+        materializer: &dyn Materializer,
+        request: SnapshotRequest,
+    ) -> Result<Option<SnapshotResult>, RepositoryError> {
+        let branch = self.current_branch().await?;
+        let parent = read_branch_ref(&self.metadata_dir, &branch).await?;
+        let parent_snapshot = self.object_store.get_snapshot(&parent).await?;
+        let capture = self.capture_working_tree(materializer).await?;
+        if capture.root_tree_id == parent_snapshot.root_tree_id() {
+            debug!(branch = branch.as_str(), parent = %parent, "working tree unchanged; skipping snapshot");
+            return Ok(None);
+        }
+
+        let snapshot = self.store_snapshot(capture, request, vec![parent]).await?;
+        write_branch_ref(&self.metadata_dir, &branch, snapshot.snapshot_id).await?;
+
+        debug!(branch = branch.as_str(), %snapshot.snapshot_id, "advanced branch ref after change capture");
+        Ok(Some(snapshot))
     }
 
     /// Returns whether the working directory matches the current branch snapshot.
@@ -364,14 +389,8 @@ impl Repository {
         &self,
         materializer: &dyn Materializer,
     ) -> Result<Option<SnapshotResult>, RepositoryError> {
-        let status = self.working_tree_status(materializer).await?;
-        if status.is_clean() {
-            Ok(None)
-        } else {
-            self.snapshot(materializer, SnapshotRequest::automatic())
-                .await
-                .map(Some)
-        }
+        self.snapshot_if_changed(materializer, SnapshotRequest::automatic())
+            .await
     }
 
     async fn capture_snapshot(
@@ -380,11 +399,28 @@ impl Repository {
         request: SnapshotRequest,
         parents: Vec<ObjectId>,
     ) -> Result<SnapshotResult, RepositoryError> {
-        let timestamp_millis = request.resolve_timestamp()?;
+        let capture = self.capture_working_tree(materializer).await?;
+        self.store_snapshot(capture, request, parents).await
+    }
+
+    async fn capture_working_tree(
+        &self,
+        materializer: &dyn Materializer,
+    ) -> Result<CaptureResult, RepositoryError> {
         let working_directory = WorkingDirectory::new(&self.root);
-        let capture = materializer
+        materializer
             .capture_tree(&working_directory, &self.object_store)
-            .await?;
+            .await
+            .map_err(RepositoryError::from)
+    }
+
+    async fn store_snapshot(
+        &self,
+        capture: CaptureResult,
+        request: SnapshotRequest,
+        parents: Vec<ObjectId>,
+    ) -> Result<SnapshotResult, RepositoryError> {
+        let timestamp_millis = request.resolve_timestamp()?;
         let snapshot = Snapshot::new(
             capture.root_tree_id,
             parents,
@@ -400,6 +436,29 @@ impl Repository {
             snapshot,
             capture,
         })
+    }
+}
+
+/// Why an automatic snapshot was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AutoSnapshotTrigger {
+    /// Snapshot created before switching context or restoring history.
+    Safety,
+    /// Snapshot created from a filesystem watch event.
+    Watch,
+    /// Snapshot created from a full reconciliation pass.
+    Reconcile,
+}
+
+impl AutoSnapshotTrigger {
+    /// Returns the stable provenance value for this trigger.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Safety => "safety",
+            Self::Watch => "watch",
+            Self::Reconcile => "reconcile",
+        }
     }
 }
 
@@ -438,11 +497,19 @@ impl SnapshotRequest {
     /// Creates request metadata for an automatic safety snapshot.
     #[must_use]
     pub fn automatic() -> Self {
+        Self::automatic_for_trigger(AutoSnapshotTrigger::Safety)
+    }
+
+    /// Creates request metadata for an automatic snapshot with structured trigger metadata.
+    #[must_use]
+    pub fn automatic_for_trigger(trigger: AutoSnapshotTrigger) -> Self {
         Self {
             timestamp_millis: None,
             author: None,
             message: None,
-            provenance: SnapshotProvenance::automatic(),
+            provenance: SnapshotProvenance::automatic()
+                .with_attribute("trigger", trigger.as_str())
+                .with_attribute("workspace", DEFAULT_WORKSPACE_ID),
         }
     }
 
@@ -464,6 +531,17 @@ impl SnapshotRequest {
     #[must_use]
     pub fn with_provenance(mut self, provenance: SnapshotProvenance) -> Self {
         self.provenance = provenance;
+        self
+    }
+
+    /// Adds or replaces a structured provenance attribute.
+    #[must_use]
+    pub fn with_provenance_attribute(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        self.provenance = self.provenance.with_attribute(key, value);
         self
     }
 

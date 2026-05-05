@@ -2,13 +2,17 @@ use anstyle::{AnsiColor, Style};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use era_core::{ObjectId, Snapshot};
-use era_materialization::{CaptureIssueKind, CaptureStats, FilesystemMaterializer};
-use era_repository::{
-    BranchHead, BranchName, BranchOperationResult, Repository, RepositoryError, RestoreResult,
-    SnapshotRequest, SnapshotResult, SwitchResult, TimelineEntry, TreeChange, TreeChangeKind,
-    WorkingTreeStatus,
+use era_materialization::{
+    CaptureIssueKind, CaptureStats, FilesystemMaterializer, MaterializationError, WatchEvent,
+    WorkingDirectory,
 };
-use std::{error::Error, fmt, path::PathBuf, process::ExitCode};
+use era_repository::{
+    AutoSnapshotTrigger, BranchHead, BranchName, BranchOperationResult, Repository,
+    RepositoryError, RestoreResult, SnapshotRequest, SnapshotResult, SwitchResult, TimelineEntry,
+    TreeChange, TreeChangeKind, WorkingTreeStatus,
+};
+use std::{error::Error, fmt, path::PathBuf, pin::Pin, process::ExitCode, time::Duration};
+use tokio::time::{self, MissedTickBehavior, Sleep};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -28,7 +32,7 @@ async fn main() -> ExitCode {
 #[derive(Debug, Parser)]
 #[command(name = "era", about = "Cheap snapshots and dense local history")]
 struct Cli {
-    /// Show full object IDs, root tree IDs, timestamps, and capture stats.
+    /// Show full object IDs, root tree IDs, provenance, and capture/cache stats.
     #[arg(short, long, global = true)]
     verbose: bool,
     #[command(subcommand)]
@@ -68,6 +72,30 @@ enum Commands {
         /// Snapshot ID, unique ID prefix, or exact snapshot label.
         target: String,
     },
+    /// Watch the working directory and create automatic snapshots after edits settle.
+    Watch {
+        /// Run one reconciliation pass and exit.
+        #[arg(long)]
+        once: bool,
+        /// Quiet period before saving after a filesystem event.
+        #[arg(long, default_value_t = 1000)]
+        debounce_ms: u64,
+        /// Periodic full reconciliation interval for missed watcher events.
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        reconcile_secs: u64,
+        /// Workspace ID recorded in automatic snapshot provenance.
+        #[arg(long, default_value = "default")]
+        workspace: String,
+        /// Agent ID recorded in automatic snapshot provenance.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Agent task ID recorded in automatic snapshot provenance.
+        #[arg(long)]
+        task: Option<String>,
+        /// Model name recorded in automatic snapshot provenance.
+        #[arg(long)]
+        model: Option<String>,
+    },
     /// Show the current branch timeline, newest snapshot first.
     Timeline,
 }
@@ -84,6 +112,31 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Branch { name } => branch(name, cli.verbose).await,
         Commands::Switch { name } => switch(name, cli.verbose).await,
         Commands::Restore { target } => restore(target, cli.verbose).await,
+        Commands::Watch {
+            once,
+            debounce_ms,
+            reconcile_secs,
+            workspace,
+            agent,
+            task,
+            model,
+        } => {
+            watch(
+                WatchArgs {
+                    once,
+                    debounce_ms,
+                    reconcile_secs,
+                    metadata: WatchMetadata {
+                        workspace,
+                        agent,
+                        task,
+                        model,
+                    },
+                },
+                cli.verbose,
+            )
+            .await
+        }
         Commands::Timeline => timeline(cli.verbose).await,
     }
 }
@@ -189,6 +242,132 @@ async fn restore(target: String, verbose: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct WatchArgs {
+    once: bool,
+    debounce_ms: u64,
+    reconcile_secs: u64,
+    metadata: WatchMetadata,
+}
+
+#[derive(Debug)]
+struct WatchMetadata {
+    workspace: String,
+    agent: Option<String>,
+    task: Option<String>,
+    model: Option<String>,
+}
+
+async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
+    let materializer = FilesystemMaterializer::new();
+    let repository = Repository::open(current_directory()?).await?;
+
+    if args.once {
+        let saved = snapshot_if_changed_for_watch(
+            &repository,
+            &materializer,
+            AutoSnapshotTrigger::Reconcile,
+            &args.metadata,
+        )
+        .await?;
+        print_watch_snapshot_result(saved.as_ref(), verbose, true);
+        return Ok(());
+    }
+
+    let working_directory = WorkingDirectory::new(repository.root());
+    let mut watch = materializer.watch(&working_directory).await?;
+    let debounce = Duration::from_millis(args.debounce_ms);
+    let mut debounce_sleep: Option<Pin<Box<Sleep>>> = None;
+    let mut reconcile = time::interval(Duration::from_secs(args.reconcile_secs));
+    reconcile.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    reconcile.tick().await;
+
+    anstream::println!("Watching for changes");
+
+    loop {
+        tokio::select! {
+            event = watch.next_event() => {
+                match event {
+                    Some(Ok(event)) => {
+                        invalidate_watch_event_paths(&materializer, &event);
+                        debounce_sleep = Some(Box::pin(time::sleep(debounce)));
+                    }
+                    Some(Err(error)) => return Err(CliError::from(error)),
+                    None => return Err(CliError::WatchStopped),
+                }
+            }
+            _ = async {
+                if let Some(sleep) = debounce_sleep.as_mut() {
+                    sleep.as_mut().await;
+                }
+            }, if debounce_sleep.is_some() => {
+                debounce_sleep = None;
+                let saved = snapshot_if_changed_for_watch(
+                    &repository,
+                    &materializer,
+                    AutoSnapshotTrigger::Watch,
+                    &args.metadata,
+                )
+                .await?;
+                print_watch_snapshot_result(saved.as_ref(), verbose, false);
+            }
+            _ = reconcile.tick() => {
+                let saved = snapshot_if_changed_for_watch(
+                    &repository,
+                    &materializer,
+                    AutoSnapshotTrigger::Reconcile,
+                    &args.metadata,
+                )
+                .await?;
+                print_watch_snapshot_result(saved.as_ref(), verbose, false);
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.map_err(|source| CliError::Signal { source })?;
+                anstream::println!("Stopped");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn snapshot_if_changed_for_watch(
+    repository: &Repository,
+    materializer: &FilesystemMaterializer,
+    trigger: AutoSnapshotTrigger,
+    metadata: &WatchMetadata,
+) -> Result<Option<SnapshotResult>, CliError> {
+    repository
+        .snapshot_if_changed(materializer, auto_snapshot_request(trigger, metadata))
+        .await
+        .map_err(CliError::from)
+}
+
+fn auto_snapshot_request(
+    trigger: AutoSnapshotTrigger,
+    metadata: &WatchMetadata,
+) -> SnapshotRequest {
+    let mut request = SnapshotRequest::automatic_for_trigger(trigger)
+        .with_provenance_attribute("workspace", metadata.workspace.clone());
+
+    if let Some(agent) = &metadata.agent {
+        request = request.with_provenance_attribute("agent", agent.clone());
+    }
+    if let Some(task) = &metadata.task {
+        request = request.with_provenance_attribute("task", task.clone());
+    }
+    if let Some(model) = &metadata.model {
+        request = request.with_provenance_attribute("model", model.clone());
+    }
+
+    request
+}
+
+fn invalidate_watch_event_paths(materializer: &FilesystemMaterializer, event: &WatchEvent) {
+    materializer.invalidate_paths(event.paths.iter());
+}
+
 async fn timeline(verbose: bool) -> Result<(), CliError> {
     let repository = Repository::open(current_directory()?).await?;
     let branch = repository.current_branch().await?;
@@ -266,12 +445,16 @@ fn print_snapshot_details(result: &SnapshotResult, branch: &BranchName) {
     );
     print_detail("Parents", result.snapshot.parents().len());
     print_detail("Source", result.snapshot.provenance().source());
+    print_provenance_attributes(&result.snapshot);
 
     if let Some(author) = result.snapshot.author() {
         print_detail("Author", author);
     }
 
-    let stats = &result.capture.stats;
+    print_capture_stats(&result.capture.stats);
+}
+
+fn print_capture_stats(stats: &CaptureStats) {
     print_detail("Files", stats.files_seen);
     print_detail("Directories", stats.directories_seen);
     print_detail("Bytes", stats.bytes_read);
@@ -279,6 +462,8 @@ fn print_snapshot_details(result: &SnapshotResult, branch: &BranchName) {
     print_detail("Trees stored", stats.trees_stored);
     print_detail("Ignored", stats.ignored_entries);
     print_detail("Symlinks", stats.symlinks_skipped);
+    print_detail("Cache hits", stats.hash_cache_hits);
+    print_detail("Cache misses", stats.hash_cache_misses);
 }
 
 fn print_section(title: &str) {
@@ -334,6 +519,7 @@ fn print_status(
         print_detail("Timestamp", format!("{} ms", snapshot.timestamp_millis()));
         print_detail("Parents", snapshot.parents().len());
         print_detail("Source", snapshot.provenance().source());
+        print_provenance_attributes(snapshot);
 
         if let Some(author) = snapshot.author() {
             print_detail("Author", author);
@@ -345,6 +531,8 @@ fn print_status(
         print_detail("Bytes", stats.bytes_read);
         print_detail("Ignored", stats.ignored_entries);
         print_detail("Symlinks", stats.symlinks_skipped);
+        print_detail("Cache hits", stats.hash_cache_hits);
+        print_detail("Cache misses", stats.hash_cache_misses);
     }
 }
 
@@ -462,6 +650,8 @@ fn print_optional_saved_snapshot(saved: Option<&SnapshotResult>) {
         print_section("Saved current work");
         print_detail("Snapshot", saved.snapshot_id);
         print_detail("Root tree", saved.snapshot.root_tree_id());
+        print_detail("Source", saved.snapshot.provenance().source());
+        print_provenance_attributes(&saved.snapshot);
     }
 }
 
@@ -485,6 +675,38 @@ fn print_scan_warnings(issues: &[era_materialization::CaptureIssue]) {
             "{style}warning:{style:#} {description}: {}",
             issue.path.display()
         );
+    }
+}
+
+fn print_watch_snapshot_result(
+    result: Option<&SnapshotResult>,
+    verbose: bool,
+    print_no_changes: bool,
+) {
+    match result {
+        Some(result) => {
+            anstream::println!(
+                "Saved auto snapshot {}",
+                styled(accent_style(), short_id(result.snapshot_id))
+            );
+            if verbose {
+                anstream::println!();
+                print_section("Details");
+                print_detail("Full snapshot", result.snapshot_id);
+                print_detail("Root tree", result.snapshot.root_tree_id());
+                print_detail(
+                    "Timestamp",
+                    format!("{} ms", result.snapshot.timestamp_millis()),
+                );
+                print_detail("Parents", result.snapshot.parents().len());
+                print_detail("Source", result.snapshot.provenance().source());
+                print_provenance_attributes(&result.snapshot);
+                print_capture_stats(&result.capture.stats);
+            }
+            print_capture_warnings(result);
+        }
+        None if print_no_changes || verbose => anstream::println!("No changes"),
+        None => {}
     }
 }
 
@@ -512,9 +734,22 @@ fn print_timeline_details(snapshot_id: ObjectId, snapshot: &Snapshot) {
     print_indented_detail("Timestamp", format!("{} ms", snapshot.timestamp_millis()));
     print_indented_detail("Parents", snapshot.parents().len());
     print_indented_detail("Source", snapshot.provenance().source());
+    print_indented_provenance_attributes(snapshot);
 
     if let Some(author) = snapshot.author() {
         print_indented_detail("Author", author);
+    }
+}
+
+fn print_provenance_attributes(snapshot: &Snapshot) {
+    for (key, value) in snapshot.provenance().attributes() {
+        print_detail(key, value);
+    }
+}
+
+fn print_indented_provenance_attributes(snapshot: &Snapshot) {
+    for (key, value) in snapshot.provenance().attributes() {
+        print_indented_detail(key, value);
     }
 }
 
@@ -527,9 +762,24 @@ fn timeline_title(snapshot: &Snapshot) -> String {
     match snapshot.message() {
         Some(message) if !message.is_empty() => message.to_owned(),
         _ if snapshot.provenance().source() == "repository-init" => "repository init".to_owned(),
-        _ if snapshot.provenance().source() == "auto-snapshot" => "auto snapshot".to_owned(),
+        _ if snapshot.provenance().source() == "auto-snapshot" => {
+            format!(
+                "auto snapshot · {}",
+                format_snapshot_time(snapshot.timestamp_millis())
+            )
+        }
         _ => snapshot.provenance().source().to_owned(),
     }
+}
+
+fn format_snapshot_time(timestamp_millis: u64) -> String {
+    use chrono::TimeZone as _;
+
+    i64::try_from(timestamp_millis)
+        .ok()
+        .and_then(|millis| Local.timestamp_millis_opt(millis).single())
+        .map(|timestamp| timestamp.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| format!("{timestamp_millis} ms"))
 }
 
 fn capture_summary(stats: &CaptureStats) -> String {
@@ -586,7 +836,10 @@ fn label_style() -> Style {
 enum CliError {
     CurrentDirectory { source: std::io::Error },
     EmptyTimeline,
+    WatchStopped,
+    Signal { source: std::io::Error },
     Repository { source: Box<RepositoryError> },
+    Materialization { source: Box<MaterializationError> },
 }
 
 impl fmt::Display for CliError {
@@ -596,7 +849,10 @@ impl fmt::Display for CliError {
                 write!(formatter, "could not determine current directory: {source}")
             }
             Self::EmptyTimeline => write!(formatter, "repository timeline is empty"),
+            Self::WatchStopped => write!(formatter, "filesystem watcher stopped"),
+            Self::Signal { source } => write!(formatter, "could not listen for Ctrl-C: {source}"),
             Self::Repository { source } => write!(formatter, "{source}"),
+            Self::Materialization { source } => write!(formatter, "{source}"),
         }
     }
 }
@@ -605,8 +861,10 @@ impl Error for CliError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CurrentDirectory { source } => Some(source),
-            Self::EmptyTimeline => None,
+            Self::EmptyTimeline | Self::WatchStopped => None,
+            Self::Signal { source } => Some(source),
             Self::Repository { source } => Some(source.as_ref()),
+            Self::Materialization { source } => Some(source.as_ref()),
         }
     }
 }
@@ -614,6 +872,14 @@ impl Error for CliError {
 impl From<RepositoryError> for CliError {
     fn from(source: RepositoryError) -> Self {
         Self::Repository {
+            source: Box::new(source),
+        }
+    }
+}
+
+impl From<MaterializationError> for CliError {
+    fn from(source: MaterializationError) -> Self {
+        Self::Materialization {
             source: Box::new(source),
         }
     }
