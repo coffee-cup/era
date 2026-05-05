@@ -1,12 +1,13 @@
 use crate::{
     CaptureIssue, CaptureIssueKind, CaptureOptions, CaptureResult, CaptureStats,
     MaterializationError, MaterializeResult, MaterializeStats, Materializer, SymlinkPolicy,
-    TreeScanResult, TreeScanStats, WorkingDirectory,
+    TreeChange, TreeComparisonResult, TreeScanResult, TreeScanStats, WorkingDirectory,
 };
 use async_trait::async_trait;
 use era_core::{EntryKind, ObjectId, Tree, TreeEntry};
 use era_object_store::ObjectStore;
 use std::{
+    cmp::Ordering,
     collections::BTreeSet,
     future::Future,
     io,
@@ -104,6 +105,50 @@ impl FilesystemMaterializer {
         );
 
         Ok(TreeScanResult::new(root_tree_id, stats, issues))
+    }
+
+    /// Compares the current working directory with a stored tree.
+    pub async fn compare_tree(
+        &self,
+        saved_root_tree_id: ObjectId,
+        working_directory: &WorkingDirectory,
+        object_store: &dyn ObjectStore,
+    ) -> Result<TreeComparisonResult, MaterializationError> {
+        let root = working_directory.root();
+        debug!(root = %root.display(), %saved_root_tree_id, "comparing working directory");
+        ensure_capture_root(root).await?;
+
+        let mut state = ComparisonState::default();
+        let current_root_tree_id = self
+            .compare_directory(
+                saved_root_tree_id,
+                root.to_path_buf(),
+                PathBuf::new(),
+                object_store,
+                &mut state,
+            )
+            .await?;
+
+        debug!(
+            root = %root.display(),
+            %saved_root_tree_id,
+            %current_root_tree_id,
+            changes = state.changes.len(),
+            files = state.stats.files_seen,
+            directories = state.stats.directories_seen,
+            bytes = state.stats.bytes_read,
+            ignored = state.stats.ignored_entries,
+            symlinks_skipped = state.stats.symlinks_skipped,
+            "compared working directory"
+        );
+
+        Ok(TreeComparisonResult::new(
+            saved_root_tree_id,
+            current_root_tree_id,
+            state.changes,
+            state.stats,
+            state.issues,
+        ))
     }
 
     /// Reconciles the working directory to match a stored tree.
@@ -308,6 +353,246 @@ impl FilesystemMaterializer {
         })
     }
 
+    fn compare_directory<'a>(
+        &'a self,
+        saved_tree_id: ObjectId,
+        directory_path: PathBuf,
+        relative_path: PathBuf,
+        object_store: &'a dyn ObjectStore,
+        state: &'a mut ComparisonState,
+    ) -> Pin<Box<dyn Future<Output = Result<ObjectId, MaterializationError>> + Send + 'a>> {
+        Box::pin(async move {
+            trace!(path = %directory_path.display(), %saved_tree_id, "comparing directory");
+            state.stats.directories_seen += 1;
+
+            let saved_tree = object_store.get_tree(&saved_tree_id).await?;
+            let current_entries = self
+                .read_included_directory_entries(&directory_path, &relative_path, state)
+                .await?;
+            let saved_entries = saved_tree.entries();
+            let mut current_tree_entries = Vec::new();
+            let mut saved_index = 0;
+            let mut current_index = 0;
+
+            while saved_index < saved_entries.len() || current_index < current_entries.len() {
+                let ordering = match (
+                    saved_entries.get(saved_index),
+                    current_entries.get(current_index),
+                ) {
+                    (Some(saved), Some(current)) => {
+                        saved.name().as_bytes().cmp(current.name.as_bytes())
+                    }
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => break,
+                };
+
+                match ordering {
+                    Ordering::Less => {
+                        let saved_entry = &saved_entries[saved_index];
+                        state.changes.push(TreeChange::deleted(join_relative(
+                            &relative_path,
+                            saved_entry.name(),
+                        )));
+                        saved_index += 1;
+                    }
+                    Ordering::Greater => {
+                        let current_entry = current_entries[current_index].clone();
+                        current_tree_entries.push(
+                            self.scan_current_entry(current_entry.clone(), state)
+                                .await?,
+                        );
+                        state
+                            .changes
+                            .push(TreeChange::added(current_entry.relative_path));
+                        current_index += 1;
+                    }
+                    Ordering::Equal => {
+                        let saved_entry = saved_entries[saved_index].clone();
+                        let current_entry = current_entries[current_index].clone();
+                        let current_tree_entry = self
+                            .compare_matching_entry(saved_entry, current_entry, object_store, state)
+                            .await?;
+                        current_tree_entries.push(current_tree_entry);
+                        saved_index += 1;
+                        current_index += 1;
+                    }
+                }
+            }
+
+            let current_tree = Tree::new(current_tree_entries).map_err(|source| {
+                MaterializationError::InvalidTreeEntry {
+                    path: directory_path.clone(),
+                    source,
+                }
+            })?;
+            let current_tree_id = current_tree.id();
+            trace!(path = %directory_path.display(), %saved_tree_id, %current_tree_id, changes = state.changes.len(), "compared directory");
+            Ok(current_tree_id)
+        })
+    }
+
+    async fn read_included_directory_entries(
+        &self,
+        directory_path: &Path,
+        relative_path: &Path,
+        state: &mut ComparisonState,
+    ) -> Result<Vec<DirectoryEntry>, MaterializationError> {
+        let directory_entries = read_directory_entries(directory_path, relative_path).await?;
+        let mut included_entries = Vec::new();
+
+        for entry in directory_entries {
+            if entry.file_type.is_dir() && self.options.excludes_directory_name(&entry.name) {
+                trace!(path = %entry.path.display(), "skipping excluded directory");
+                state.stats.ignored_entries += 1;
+                continue;
+            }
+
+            if entry.file_type.is_symlink() {
+                match self.options.symlink_policy() {
+                    SymlinkPolicy::Skip => {
+                        trace!(path = %entry.path.display(), "skipping symlink");
+                        state.stats.symlinks_skipped += 1;
+                        state.issues.push(CaptureIssue::new(
+                            entry.relative_path,
+                            CaptureIssueKind::SkippedSymlink,
+                        ));
+                        continue;
+                    }
+                    SymlinkPolicy::Error => {
+                        return Err(MaterializationError::SymlinkUnsupported { path: entry.path });
+                    }
+                }
+            }
+
+            if !entry.file_type.is_dir() && !entry.file_type.is_file() {
+                return Err(MaterializationError::UnsupportedFileType { path: entry.path });
+            }
+
+            included_entries.push(entry);
+        }
+
+        Ok(included_entries)
+    }
+
+    async fn scan_current_entry(
+        &self,
+        entry: DirectoryEntry,
+        state: &mut ComparisonState,
+    ) -> Result<TreeEntry, MaterializationError> {
+        if entry.file_type.is_dir() {
+            let id = self
+                .scan_directory(
+                    entry.path.clone(),
+                    entry.relative_path.clone(),
+                    &mut state.stats,
+                    &mut state.issues,
+                )
+                .await?;
+            TreeEntry::tree(entry.name, id).map_err(|source| {
+                MaterializationError::InvalidTreeEntry {
+                    path: entry.path,
+                    source,
+                }
+            })
+        } else if entry.file_type.is_file() {
+            let id = read_current_file_id(&entry, &mut state.stats).await?;
+            TreeEntry::blob(entry.name, id).map_err(|source| {
+                MaterializationError::InvalidTreeEntry {
+                    path: entry.path,
+                    source,
+                }
+            })
+        } else if entry.file_type.is_symlink() {
+            match self.options.symlink_policy() {
+                SymlinkPolicy::Skip => {
+                    Err(MaterializationError::UnsupportedFileType { path: entry.path })
+                }
+                SymlinkPolicy::Error => {
+                    Err(MaterializationError::SymlinkUnsupported { path: entry.path })
+                }
+            }
+        } else {
+            Err(MaterializationError::UnsupportedFileType { path: entry.path })
+        }
+    }
+
+    async fn compare_matching_entry(
+        &self,
+        saved_entry: TreeEntry,
+        current_entry: DirectoryEntry,
+        object_store: &dyn ObjectStore,
+        state: &mut ComparisonState,
+    ) -> Result<TreeEntry, MaterializationError> {
+        match (saved_entry.kind(), current_entry.file_type.is_dir()) {
+            (EntryKind::Blob, false) if current_entry.file_type.is_file() => {
+                let id = read_current_file_id(&current_entry, &mut state.stats).await?;
+                if id != saved_entry.id() {
+                    state
+                        .changes
+                        .push(TreeChange::modified(current_entry.relative_path));
+                }
+                TreeEntry::blob(current_entry.name, id).map_err(|source| {
+                    MaterializationError::InvalidTreeEntry {
+                        path: current_entry.path,
+                        source,
+                    }
+                })
+            }
+            (EntryKind::Tree, true) => {
+                let id = self
+                    .compare_directory(
+                        saved_entry.id(),
+                        current_entry.path.clone(),
+                        current_entry.relative_path.clone(),
+                        object_store,
+                        state,
+                    )
+                    .await?;
+                TreeEntry::tree(current_entry.name, id).map_err(|source| {
+                    MaterializationError::InvalidTreeEntry {
+                        path: current_entry.path,
+                        source,
+                    }
+                })
+            }
+            (EntryKind::Blob, true) => {
+                let id = self
+                    .scan_directory(
+                        current_entry.path.clone(),
+                        current_entry.relative_path.clone(),
+                        &mut state.stats,
+                        &mut state.issues,
+                    )
+                    .await?;
+                state
+                    .changes
+                    .push(TreeChange::type_changed(current_entry.relative_path));
+                TreeEntry::tree(current_entry.name, id).map_err(|source| {
+                    MaterializationError::InvalidTreeEntry {
+                        path: current_entry.path,
+                        source,
+                    }
+                })
+            }
+            (EntryKind::Tree, false) if current_entry.file_type.is_file() => {
+                let id = read_current_file_id(&current_entry, &mut state.stats).await?;
+                state
+                    .changes
+                    .push(TreeChange::type_changed(current_entry.relative_path));
+                TreeEntry::blob(current_entry.name, id).map_err(|source| {
+                    MaterializationError::InvalidTreeEntry {
+                        path: current_entry.path,
+                        source,
+                    }
+                })
+            }
+            _ => Err(MaterializationError::UnsupportedFileType {
+                path: current_entry.path,
+            }),
+        }
+    }
+
     fn materialize_directory<'a>(
         &'a self,
         tree_id: ObjectId,
@@ -362,6 +647,21 @@ impl Materializer for FilesystemMaterializer {
         FilesystemMaterializer::scan_tree(self, working_directory).await
     }
 
+    async fn compare_tree(
+        &self,
+        saved_root_tree_id: ObjectId,
+        working_directory: &WorkingDirectory,
+        object_store: &dyn ObjectStore,
+    ) -> Result<TreeComparisonResult, MaterializationError> {
+        FilesystemMaterializer::compare_tree(
+            self,
+            saved_root_tree_id,
+            working_directory,
+            object_store,
+        )
+        .await
+    }
+
     async fn materialize_tree(
         &self,
         root_tree_id: ObjectId,
@@ -378,7 +678,14 @@ impl Materializer for FilesystemMaterializer {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+struct ComparisonState {
+    stats: TreeScanStats,
+    issues: Vec<CaptureIssue>,
+    changes: Vec<TreeChange>,
+}
+
+#[derive(Debug, Clone)]
 struct DirectoryEntry {
     name: String,
     path: PathBuf,
@@ -447,6 +754,21 @@ async fn read_directory_entries(
 
     entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
     Ok(entries)
+}
+
+async fn read_current_file_id(
+    entry: &DirectoryEntry,
+    stats: &mut TreeScanStats,
+) -> Result<ObjectId, MaterializationError> {
+    let bytes = fs::read(&entry.path)
+        .await
+        .map_err(|source| io_error(entry.path.clone(), source))?;
+    let id = ObjectId::from_content(&bytes);
+
+    stats.files_seen += 1;
+    stats.bytes_read += bytes.len() as u64;
+    trace!(path = %entry.path.display(), %id, bytes = bytes.len(), "scanned file blob");
+    Ok(id)
 }
 
 async fn prune_directory(

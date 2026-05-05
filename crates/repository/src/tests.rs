@@ -242,6 +242,7 @@ async fn working_tree_status_detects_clean_and_dirty_states() {
     let dirty = repo.working_tree_status(&materializer).await.unwrap();
     assert!(!dirty.is_clean());
     assert_ne!(dirty.current_root_tree_id, dirty.snapshot.root_tree_id());
+    assert_eq!(dirty.changes(), &[TreeChange::modified("README.md")]);
 
     repo.snapshot(
         &materializer,

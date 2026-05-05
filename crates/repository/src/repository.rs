@@ -9,7 +9,8 @@ use crate::{
 };
 use era_core::{ObjectId, ObjectKind, Snapshot, SnapshotProvenance};
 use era_materialization::{
-    CaptureResult, MaterializeResult, Materializer, TreeScanResult, WorkingDirectory,
+    CaptureResult, MaterializeResult, Materializer, TreeChange, TreeComparisonResult,
+    WorkingDirectory,
 };
 use era_object_store::LocalObjectStore;
 use std::{
@@ -133,16 +134,22 @@ impl Repository {
         let snapshot_id = self.current_snapshot_id().await?;
         let snapshot = self.object_store.get_snapshot(&snapshot_id).await?;
         let working_directory = WorkingDirectory::new(&self.root);
-        let scan = materializer.scan_tree(&working_directory).await?;
-        let current_root_tree_id = scan.root_tree_id;
-        let clean = current_root_tree_id == snapshot.root_tree_id();
+        let comparison = materializer
+            .compare_tree(
+                snapshot.root_tree_id(),
+                &working_directory,
+                &self.object_store,
+            )
+            .await?;
+        let current_root_tree_id = comparison.current_root_tree_id;
+        let clean = comparison.is_clean();
 
         Ok(WorkingTreeStatus {
             snapshot_id,
             snapshot,
             current_root_tree_id,
             clean,
-            scan,
+            comparison,
         })
     }
 
@@ -505,8 +512,8 @@ pub struct WorkingTreeStatus {
     pub current_root_tree_id: ObjectId,
     /// Whether the working directory root tree matches the saved snapshot root tree.
     pub clean: bool,
-    /// Read-only scan result used for the comparison.
-    pub scan: TreeScanResult,
+    /// Read-only comparison result used for the status.
+    pub comparison: TreeComparisonResult,
 }
 
 impl WorkingTreeStatus {
@@ -514,6 +521,12 @@ impl WorkingTreeStatus {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.clean
+    }
+
+    /// Returns path-level changes from the current snapshot to the working directory.
+    #[must_use]
+    pub fn changes(&self) -> &[TreeChange] {
+        &self.comparison.changes
     }
 }
 

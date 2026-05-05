@@ -6,6 +6,7 @@ mod refs;
 mod repository;
 
 pub use branch::{BranchName, InvalidBranchName, InvalidBranchNameReason};
+pub use era_materialization::{TreeChange, TreeChangeKind};
 pub use error::RepositoryError;
 pub use repository::{
     BranchHead, BranchOperationResult, InitResult, Repository, ResolvedSnapshot, RestoreResult,

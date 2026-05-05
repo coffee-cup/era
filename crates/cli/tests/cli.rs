@@ -207,6 +207,7 @@ fn status_detects_changes_and_snap_makes_it_clean() -> Result<(), Box<dyn Error>
         field_line_value(&dirty_stdout, "Working"),
         "changes detected; run `era snap` to save"
     );
+    assert!(dirty_stdout.contains("\nChanges\n  M README.md\n"));
 
     era(work).args(["snap", "remember this"]).assert().success();
     let clean = era(work).arg("status").assert().success();

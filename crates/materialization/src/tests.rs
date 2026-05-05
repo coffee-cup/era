@@ -240,6 +240,89 @@ async fn scan_tree_matches_capture_without_storing_objects() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn compare_tree_reports_path_level_changes() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    fs::create_dir(work.join("dir-to-file")).await.unwrap();
+    fs::write(work.join("dir-to-file/nested.txt"), b"nested")
+        .await
+        .unwrap();
+    fs::create_dir(work.join("empty")).await.unwrap();
+    fs::write(work.join("file-to-dir"), b"file").await.unwrap();
+    fs::create_dir(work.join("src")).await.unwrap();
+    fs::write(work.join("src/main.rs"), b"fn main() {}")
+        .await
+        .unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+    let captured = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    fs::remove_dir_all(work.join("dir-to-file")).await.unwrap();
+    fs::write(work.join("dir-to-file"), b"now a file")
+        .await
+        .unwrap();
+    fs::remove_dir(work.join("empty")).await.unwrap();
+    fs::write(work.join("extra.txt"), b"extra").await.unwrap();
+    fs::remove_file(work.join("file-to-dir")).await.unwrap();
+    fs::create_dir(work.join("file-to-dir")).await.unwrap();
+    fs::remove_file(work.join("src/main.rs")).await.unwrap();
+
+    let comparison = materializer
+        .compare_tree(captured.root_tree_id, &WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    let scan = materializer
+        .scan_tree(&WorkingDirectory::new(&work))
+        .await
+        .unwrap();
+
+    assert_eq!(comparison.current_root_tree_id, scan.root_tree_id);
+    assert!(!comparison.is_clean());
+    assert_eq!(
+        comparison.changes,
+        vec![
+            TreeChange::modified("README.md"),
+            TreeChange::type_changed("dir-to-file"),
+            TreeChange::deleted("empty"),
+            TreeChange::added("extra.txt"),
+            TreeChange::type_changed("file-to-dir"),
+            TreeChange::deleted("src/main.rs"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn compare_tree_ignores_excluded_added_directories() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+    let captured = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    fs::create_dir(work.join("target")).await.unwrap();
+    fs::write(work.join("target/generated.txt"), b"ignored")
+        .await
+        .unwrap();
+
+    let comparison = materializer
+        .compare_tree(captured.root_tree_id, &WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert!(comparison.is_clean());
+    assert!(comparison.changes.is_empty());
+    assert_eq!(comparison.stats.ignored_entries, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn materialize_tree_reconciles_working_directory_and_preserves_excluded_dirs() {
     let temp = TempDir::new().unwrap();
     let work = create_workdir(&temp).await;
@@ -428,6 +511,37 @@ async fn symlinks_are_skipped_by_default_without_following() {
     assert_eq!(result.stats.symlinks_skipped, 1);
     assert_eq!(
         result.issues,
+        vec![CaptureIssue::new(
+            PathBuf::from("link.txt"),
+            CaptureIssueKind::SkippedSymlink,
+        )]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn compare_tree_skips_added_symlinks_without_reporting_changes() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("real.txt"), b"real").await.unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+    let captured = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    unix_fs::symlink("real.txt", work.join("link.txt")).unwrap();
+
+    let comparison = materializer
+        .compare_tree(captured.root_tree_id, &WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert!(comparison.is_clean());
+    assert!(comparison.changes.is_empty());
+    assert_eq!(comparison.stats.symlinks_skipped, 1);
+    assert_eq!(
+        comparison.issues,
         vec![CaptureIssue::new(
             PathBuf::from("link.txt"),
             CaptureIssueKind::SkippedSymlink,

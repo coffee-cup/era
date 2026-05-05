@@ -32,6 +32,14 @@ pub trait Materializer: Send + Sync {
         working_directory: &WorkingDirectory,
     ) -> Result<TreeScanResult, MaterializationError>;
 
+    /// Compares the current working directory with a stored root tree.
+    async fn compare_tree(
+        &self,
+        saved_root_tree_id: ObjectId,
+        working_directory: &WorkingDirectory,
+        object_store: &dyn ObjectStore,
+    ) -> Result<TreeComparisonResult, MaterializationError>;
+
     /// Reconciles the working directory to match a stored tree.
     async fn materialize_tree(
         &self,
@@ -164,6 +172,101 @@ impl TreeScanResult {
             issues,
         }
     }
+}
+
+/// Result of comparing a working directory with a stored tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeComparisonResult {
+    /// Root tree ID of the saved snapshot used as the comparison base.
+    pub saved_root_tree_id: ObjectId,
+    /// Root tree ID computed from the current working directory.
+    pub current_root_tree_id: ObjectId,
+    /// Path-level changes from the saved tree to the current working directory.
+    pub changes: Vec<TreeChange>,
+    /// Aggregate scan counts for the current working directory.
+    pub stats: TreeScanStats,
+    /// Non-fatal issues encountered during comparison.
+    pub issues: Vec<CaptureIssue>,
+}
+
+impl TreeComparisonResult {
+    /// Creates a tree comparison result.
+    #[must_use]
+    pub fn new(
+        saved_root_tree_id: ObjectId,
+        current_root_tree_id: ObjectId,
+        changes: Vec<TreeChange>,
+        stats: TreeScanStats,
+        issues: Vec<CaptureIssue>,
+    ) -> Self {
+        Self {
+            saved_root_tree_id,
+            current_root_tree_id,
+            changes,
+            stats,
+            issues,
+        }
+    }
+
+    /// Returns `true` when no path-level changes were found.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.saved_root_tree_id == self.current_root_tree_id && self.changes.is_empty()
+    }
+}
+
+/// A path-level change between a saved tree and the current working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeChange {
+    /// Path relative to the working directory root.
+    pub path: PathBuf,
+    /// Kind of change detected for this path.
+    pub kind: TreeChangeKind,
+}
+
+impl TreeChange {
+    /// Creates a path-level change.
+    #[must_use]
+    pub fn new(path: PathBuf, kind: TreeChangeKind) -> Self {
+        Self { path, kind }
+    }
+
+    /// Creates an added-path change.
+    #[must_use]
+    pub fn added(path: impl Into<PathBuf>) -> Self {
+        Self::new(path.into(), TreeChangeKind::Added)
+    }
+
+    /// Creates a modified-path change.
+    #[must_use]
+    pub fn modified(path: impl Into<PathBuf>) -> Self {
+        Self::new(path.into(), TreeChangeKind::Modified)
+    }
+
+    /// Creates a deleted-path change.
+    #[must_use]
+    pub fn deleted(path: impl Into<PathBuf>) -> Self {
+        Self::new(path.into(), TreeChangeKind::Deleted)
+    }
+
+    /// Creates a type-changed-path change.
+    #[must_use]
+    pub fn type_changed(path: impl Into<PathBuf>) -> Self {
+        Self::new(path.into(), TreeChangeKind::TypeChanged)
+    }
+}
+
+/// Kind of path-level tree change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TreeChangeKind {
+    /// Path exists only in the current working directory.
+    Added,
+    /// Path exists in both trees but points at different file contents.
+    Modified,
+    /// Path exists only in the saved tree.
+    Deleted,
+    /// Path changed between a file and a directory.
+    TypeChanged,
 }
 
 /// Aggregate counts for a read-only tree scan.

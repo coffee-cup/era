@@ -5,7 +5,8 @@ use era_core::{ObjectId, Snapshot};
 use era_materialization::{CaptureIssueKind, CaptureStats, FilesystemMaterializer};
 use era_repository::{
     BranchHead, BranchName, BranchOperationResult, Repository, RepositoryError, RestoreResult,
-    SnapshotRequest, SnapshotResult, SwitchResult, TimelineEntry, WorkingTreeStatus,
+    SnapshotRequest, SnapshotResult, SwitchResult, TimelineEntry, TreeChange, TreeChangeKind,
+    WorkingTreeStatus,
 };
 use std::{error::Error, fmt, path::PathBuf, process::ExitCode};
 use tracing_subscriber::EnvFilter;
@@ -143,7 +144,7 @@ async fn status(verbose: bool) -> Result<(), CliError> {
         verbose,
         &branch_ref,
     );
-    print_scan_warnings(&status.scan.issues);
+    print_scan_warnings(&status.comparison.issues);
     Ok(())
 }
 
@@ -317,6 +318,8 @@ fn print_status(
         print_field("Message", message);
     }
 
+    print_status_changes(status.changes());
+
     if verbose {
         anstream::println!();
         print_section("Details");
@@ -336,12 +339,43 @@ fn print_status(
             print_detail("Author", author);
         }
 
-        let stats = &status.scan.stats;
+        let stats = &status.comparison.stats;
         print_detail("Files", stats.files_seen);
         print_detail("Directories", stats.directories_seen);
         print_detail("Bytes", stats.bytes_read);
         print_detail("Ignored", stats.ignored_entries);
         print_detail("Symlinks", stats.symlinks_skipped);
+    }
+}
+
+fn print_status_changes(changes: &[TreeChange]) {
+    if changes.is_empty() {
+        return;
+    }
+
+    anstream::println!();
+    print_section("Changes");
+    for change in changes {
+        let marker = styled(change_style(change.kind), change_marker(change.kind));
+        anstream::println!("  {marker} {}", change.path.display());
+    }
+}
+
+fn change_marker(kind: TreeChangeKind) -> &'static str {
+    match kind {
+        TreeChangeKind::Added => "A",
+        TreeChangeKind::Modified => "M",
+        TreeChangeKind::Deleted => "D",
+        TreeChangeKind::TypeChanged => "T",
+    }
+}
+
+fn change_style(kind: TreeChangeKind) -> Style {
+    match kind {
+        TreeChangeKind::Added => success_style(),
+        TreeChangeKind::Modified => warning_style(),
+        TreeChangeKind::Deleted => error_style(),
+        TreeChangeKind::TypeChanged => timeline_style(),
     }
 }
 
