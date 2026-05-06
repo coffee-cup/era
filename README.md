@@ -4,18 +4,9 @@
 
 Era is an experimental Rust workspace for a version control system built for agentic work: cheap snapshots, instant branches, dense local history, structured provenance, and safer local workflows.
 
-The v0 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The implementation plan is tracked in [`docs/PLAN.md`](docs/PLAN.md).
+The v0 architecture is documented in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 > Status: early v0 prototype. The local snapshot, branch, restore, status, and foreground watch flows work, but Era is not yet a production replacement for git.
-
-## Workspace layout
-
-- `crates/core` (`era-core`) — shared domain types and primitives.
-- `crates/object-store` (`era-object-store`) — content-addressed storage abstractions and implementations.
-- `crates/materialization` (`era-materialization`) — working-directory materialization, filesystem observation, and in-memory hash caching.
-- `crates/repository` (`era-repository`) — branch, snapshot, history, provenance, and policy orchestration.
-- `crates/cli` (`era-cli`, binary `era`) — command-line interface over the library APIs.
-- `docs/` — architecture and design documentation.
 
 ## Current status
 
