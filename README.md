@@ -131,7 +131,9 @@ The implemented foundation covers:
 - Foreground `era watch` auto-snapshots with debounce, periodic reconciliation, and structured provenance.
 - A per-materializer in-memory hash cache for long-running watch sessions.
 
-Notable future work includes persistent workspace hash caches, workspace fleet supervision, richer diff/merge flows, tracking heuristics, provenance indexing/querying, and git interoperability.
+The foundation also includes a snapshot-agnostic text merge engine with structured conflicts; repository/CLI merge workflows are not wired yet.
+
+Notable future work includes persistent workspace hash caches, workspace fleet supervision, repository-level diff/merge flows, semantic merge strategies, tracking heuristics, provenance indexing/querying, and git interoperability.
 
 ## Prerequisites
 

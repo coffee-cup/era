@@ -307,6 +307,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "era-merge"
+version = "0.1.0"
+
+[[package]]
 name = "era-object-store"
 version = "0.1.0"
 dependencies = [

@@ -194,9 +194,9 @@ Those responsibilities belong to materialization, object-store, workspace-level 
 - Snapshot graph traversal loads snapshots from the repository-owned snapshot index, including unnamed futures left behind by restore.
 - The v0 snapshot index is a filesystem-backed ID index; richer compact graph/provenance indexes can replace it for very large histories without changing snapshot objects.
 - Branch refs remain the repository-root named-line mechanism; workspace refs are the per-directory agent mechanism.
-- Merge, garbage collection, sync, and fleet supervision are future work.
+- Repository-level merge orchestration, garbage collection, sync, and fleet supervision are future work. The snapshot-agnostic `era-merge` file engine exists for future merge orchestration.
 - Workspace registry records are lightweight path metadata; watcher loops and hash caches remain outside shared repo state.
 
 ## Future seams
 
-Repository is where richer policy belongs: merge, diff, tracking heuristics, provenance indexes, workspace fleet supervision, and sync coordination. Those features should preserve the boundary that shared repository state is objects, refs, graph metadata, workspace registry records, and indexes, while watcher/debounce/hash-cache state remains workspace-scoped.
+Repository is where richer policy belongs: merge-base selection, tree merge planning, diff, tracking heuristics, provenance indexes, workspace fleet supervision, and sync coordination. File-level merge logic belongs behind the snapshot-agnostic `era-merge` adapter boundary so future snapshot storage changes do not rewrite merge strategies. Those features should preserve the boundary that shared repository state is objects, refs, graph metadata, workspace registry records, and indexes, while watcher/debounce/hash-cache state remains workspace-scoped.

@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/object-store",
     "crates/materialization",
+    "crates/merge",
     "crates/repository",
     "crates/cli",
 ]

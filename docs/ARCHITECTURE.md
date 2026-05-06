@@ -99,6 +99,7 @@ These companion documents expand the architecture by component and should stay a
 - [Core](components/core.md) — shared object identity, tree, snapshot, and provenance model.
 - [Object Store](components/object-store.md) — content-addressed persistence and integrity verification.
 - [Materialization](components/materialization.md) — working-directory capture, comparison, restore, watching, and hash caching.
+- [Merge](components/merge.md) — snapshot-agnostic file merge strategies and structured conflicts.
 - [Repository](components/repository.md) — refs/cursors, snapshot policy, status, timeline, switch, and restore orchestration.
 - [CLI](components/cli.md) — command surface, terminal output, tracing setup, and foreground watch loop.
 
@@ -147,6 +148,12 @@ Responsibilities:
 The current repository implementation covers local init, open, labeled user-requested snapshots, changed-only unlabeled snapshots, changed-only automatic snapshots, first-parent timeline walking, indexed snapshot graph traversal, path-aware working-tree status comparison, branch listing/creation/switching, workspace add/list, lazy workspace connection through CLI `--repo`, and whole-tree restore. Init creates `.era/HEAD`, `.era/refs/heads/main`, `.era/objects`, and `.era/index/snapshots`, captures the working directory through the materializer, stores an initial snapshot, records it in the snapshot index, and points `main` at it. External workspaces store a pointer file at `<workspace>/.era`, registry path metadata under `.era/workspaces/<id>/path`, and an independent cursor under `.era/refs/workspaces/<id>`. Labeled snapshots capture the current tree, store a snapshot with the current cursor tip as parent, index it, and advance the cursor even if the tree did not change so the label has a durable place to live. Unlabeled snapshot requests capture the current tree and advance the cursor only when the root tree differs from the current snapshot, avoiding duplicate history entries. Status compares the working tree to the current cursor snapshot and reports the root tree comparison plus sorted path-level changes. Branch creation writes another ref pointing at the current saved snapshot. Switching branches and restoring snapshots save unsnapped work first, then ask the materializer to reconcile the working directory; switching inside an external workspace advances that workspace cursor instead of global `HEAD`. Restore resolves its target before the safety snapshot, materializes the target tree, and moves the active branch/workspace cursor to the restored snapshot. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance. Object writes remain lock-free; mutable refs, workspace registry records, and snapshot index rebuilds are protected with scoped lock files and atomic ref replacement.
 
 The repository is where intelligence lives. It is also where most of the v0 design space is, because the rules for "when do we snapshot, what do we include, how do we merge" are precisely what differentiates this system from git.
+
+### Merge Engine
+
+The merge engine is a snapshot-agnostic file-level component. It takes base/ours/theirs byte versions plus optional path hints and returns either a resolved file state or structured conflicts. It does not know about snapshots, object IDs, refs, or working directories; repository merge orchestration adapts stored versions into merge inputs.
+
+The current implementation provides a strategy chain and a deterministic line-oriented three-way merge fallback. Semantic merge drivers can be added as strategies that run before the line fallback, for example JavaScript-aware or JSON-aware merge. If a semantic strategy cannot parse or support a file, it returns unsupported and the engine falls back to line merge.
 
 ### CLI / Library API
 

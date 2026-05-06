@@ -205,4 +205,4 @@ The library APIs remain the primary integration surface.
 
 ## Future seams
 
-As the library API matures, CLI commands should remain small wrappers around reusable repository operations. Agent harnesses, editor plugins, and automation should be able to reproduce CLI behavior through library calls without depending on terminal parsing.
+As the library API matures, CLI commands should remain small wrappers around reusable repository operations. Agent harnesses, editor plugins, and automation should be able to reproduce CLI behavior through library calls without depending on terminal parsing. Future merge commands should render structured conflicts produced by repository orchestration and `era-merge`, not make conflict marker text the durable model.
