@@ -7,8 +7,9 @@ This project is a Rust workspace for a version control system designed around ch
 Before making architectural or behavioral changes:
 
 1. Read `docs/ARCHITECTURE.md`.
-2. Read any related files in `docs/` that cover the area you are changing.
-3. Update `docs/ARCHITECTURE.md` and related docs when code changes alter the architecture, workflows, or operational assumptions.
+2. Read the relevant component reference in `docs/components/`.
+3. Read any other related files in `docs/` that cover the area you are changing.
+4. Update `docs/ARCHITECTURE.md`, relevant component docs, and related docs when code changes alter the architecture, workflows, public commands, or operational assumptions.
 
 ## Workspace layout
 
@@ -17,7 +18,7 @@ Before making architectural or behavioral changes:
 - `crates/materialization` — working-directory materialization and filesystem observation.
 - `crates/repository` — branch, snapshot, history, and policy orchestration.
 - `crates/cli` — command-line interface over the library APIs.
-- `docs/` — architecture and design documentation.
+- `docs/` — architecture, component references, and design documentation.
 
 ## Commands
 

@@ -71,19 +71,30 @@ Structured metadata attached to each snapshot describing how it came to exist. F
 
 ## Architectural Layers
 
-The system is composed of four layers, each with a clear responsibility and a narrow interface to the layers above and below.
+The system is composed of four layers, each with a clear responsibility and a narrow interface to the layers above and below. `era-core` sits beside those layers as the shared domain model: object identity, trees, snapshots, and provenance.
 
 ```
-┌─────────────────────────────────────────────┐
-│  CLI / Library API                          │
-├─────────────────────────────────────────────┤
-│  Repository                                 │
-├─────────────────────────────────────────────┤
-│  Materialization                            │
-├─────────────────────────────────────────────┤
-│  Object Store                               │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐      ┌─────────────────────────────┐
+│  CLI / Library API                          │─────▶│  Core domain model          │
+├─────────────────────────────────────────────┤      │                             │
+│  Repository                                 │─────▶│  ObjectId                   │
+├─────────────────────────────────────────────┤      │  Tree                       │
+│  Materialization                            │─────▶│  Snapshot                   │
+├─────────────────────────────────────────────┤      │  Provenance                 │
+│  Object Store                               │─────▶│                             │
+└─────────────────────────────────────────────┘      │  shared vocabulary          │
+                                                     └─────────────────────────────┘
 ```
+
+### Component References
+
+These companion documents expand the architecture by component and should stay aligned with this document:
+
+- [Core](components/core.md) — shared object identity, tree, snapshot, and provenance model.
+- [Object Store](components/object-store.md) — content-addressed persistence and integrity verification.
+- [Materialization](components/materialization.md) — working-directory capture, comparison, restore, watching, and hash caching.
+- [Repository](components/repository.md) — refs, branches, snapshot policy, status, timeline, switch, and restore orchestration.
+- [CLI](components/cli.md) — command surface, terminal output, tracing setup, and foreground watch loop.
 
 ### Object Store
 
@@ -123,9 +134,9 @@ The orchestration layer. Knows about branches, history, snapshots-in-context, an
 Responsibilities:
 
 - Manage branches and their references
-- Drive the auto-snapshot loop: receive change events from the materializer, decide when to capture a snapshot, write it through the object store
+- Apply snapshot policy for manual, automatic, and safety snapshots
 - Implement higher-level operations: diff between snapshots, walk history, merge branches
-- Apply tracking heuristics: decide which files should and should not be part of snapshots
+- Coordinate tracking policy with the materialization layer's include/exclude behavior
 
 The current repository implementation covers local init, open, manual snapshots, changed-only automatic snapshots, first-parent timeline walking, path-aware working-tree status comparison, branch listing/creation/switching, and whole-tree restore. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Manual snapshots capture the current tree, store a snapshot with the current branch tip as parent, and advance the branch ref. Automatic snapshot requests capture the current tree and advance the branch only when the root tree differs from the current snapshot, avoiding duplicate history entries. Status compares the working tree to the current branch snapshot and reports the root tree comparison plus sorted path-level changes. Branch creation writes another ref pointing at the current saved snapshot. Switching branches and restoring snapshots save unsnapped work first, then ask the materializer to reconcile the working directory. Restore materializes a target snapshot without moving the current branch ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
 
@@ -157,7 +168,7 @@ This cache is the single most important performance component in the system. Wit
 
 The auto-snapshot model requires knowing when the working directory has changed. The materialization layer watches the working directory using platform-native facilities and emits change events upward.
 
-The current user-facing form is foreground `era watch`, not a daemon started by `era init`. It debounces watcher events, invalidates affected hash-cache entries, and periodically reconciles the full working tree to catch missed events. Watchers are imperfect: events can be lost, coalesced, or duplicated, and edge cases differ across platforms. The repository layer treats watcher events as hints, not ground truth — reconciliation still walks the working tree to confirm what changed, using the hash cache to keep this cheap.
+The current user-facing form is foreground `era watch`, not a daemon started by `era init`. It debounces watcher events, invalidates affected hash-cache entries, and periodically reconciles the full working tree to catch missed events. Watchers are imperfect: events can be lost, coalesced, or duplicated, and edge cases differ across platforms. The watch flow treats events as hints, not ground truth — reconciliation still walks the working tree to confirm what changed, using the hash cache to keep this cheap.
 
 ### Intelligent Tracking
 
@@ -307,7 +318,7 @@ To make the layers concrete, here is what happens when a file changes:
 
 1. **An editor (or agent) writes to a file** in the working directory.
 2. **The materialization layer's watcher** observes the write and emits a change event.
-3. **The repository layer** debounces a series of such events and decides a snapshot is warranted.
+3. **The watch loop** debounces a series of such events and asks the repository for a changed-only automatic snapshot.
 4. **The repository asks the materializer** to compute the current tree state. The materializer walks the working directory, using the hash cache to skip unchanged files during long-running watch sessions.
 5. **For any file whose hash is new**, the materializer hands the bytes to the object store, which stores them and returns a hash. (Most files are unchanged and produce no new objects.)
 6. **The materializer builds tree objects** from the bottom up, again writing only new trees to the object store. Most trees are reused from the previous snapshot.
