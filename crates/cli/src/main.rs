@@ -8,13 +8,23 @@ use era_materialization::{
 };
 use era_repository::{
     AddWorkspaceOptions, AutoSnapshotTrigger, BranchHead, BranchName, BranchOperationResult,
-    CursorInfo, Repository, RepositoryError, RestoreResult, SnapshotRequest, SnapshotResult,
-    SwitchResult, TimelineEntry, TreeChange, TreeChangeKind, WorkingTreeStatus, WorkspaceAddResult,
-    WorkspaceHead, WorkspaceId,
+    CursorInfo, Repository, RepositoryError, RestoreResult, SnapshotGraph, SnapshotRequest,
+    SnapshotResult, SwitchResult, TimelineEntry, TreeChange, TreeChangeKind, WorkingTreeStatus,
+    WorkspaceAddResult, WorkspaceHead, WorkspaceId,
 };
-use std::{error::Error, fmt, path::PathBuf, pin::Pin, process::ExitCode, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    path::PathBuf,
+    pin::Pin,
+    process::ExitCode,
+    time::Duration,
+};
 use tokio::time::{self, MissedTickBehavior, Sleep};
 use tracing_subscriber::EnvFilter;
+
+const MIN_COLLAPSED_AUTO_SNAPSHOTS: usize = 3;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -81,7 +91,7 @@ enum Commands {
         /// Branch name to switch to.
         name: String,
     },
-    /// Restore a snapshot ID, unique prefix, or exact label into the working directory.
+    /// Restore a snapshot ID, unique prefix, or exact label and move the current cursor to it.
     Restore {
         /// Snapshot ID, unique ID prefix, or exact snapshot label.
         target: String,
@@ -119,7 +129,7 @@ enum Commands {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Show the current cursor timeline, newest snapshot first.
+    /// Show the indexed snapshot graph with the current cursor marked.
     Timeline {
         /// Shared Era repository to lazily connect this directory to before showing the timeline.
         #[arg(long)]
@@ -483,10 +493,43 @@ async fn timeline(
     let materializer = FilesystemMaterializer::new();
     let repository = open_command_repository(&materializer, repo, workspace).await?;
     let cursor = repository.cursor_info().await?;
-    let entries = repository.timeline().await?;
+    let graph = load_printable_timeline_graph(&repository, &materializer).await?;
 
-    print_timeline(&cursor, &entries, verbose);
+    print_timeline_graph(&cursor, &graph, verbose);
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PrintableTimelineGraph {
+    graph: SnapshotGraph,
+    current_snapshot_id: ObjectId,
+    worktree_root_tree_id: ObjectId,
+    worktree_matches: BTreeSet<ObjectId>,
+    worktree_clean: bool,
+}
+
+async fn load_printable_timeline_graph(
+    repository: &Repository,
+    materializer: &FilesystemMaterializer,
+) -> Result<PrintableTimelineGraph, CliError> {
+    let graph = repository.snapshot_graph().await?;
+    let current_snapshot_id = repository.current_snapshot_id().await?;
+    let status = repository.working_tree_status(materializer).await?;
+    let worktree_root_tree_id = status.current_root_tree_id;
+    let worktree_matches = graph
+        .entries
+        .iter()
+        .filter(|entry| entry.snapshot.root_tree_id() == worktree_root_tree_id)
+        .map(|entry| entry.snapshot_id)
+        .collect();
+
+    Ok(PrintableTimelineGraph {
+        graph,
+        current_snapshot_id,
+        worktree_root_tree_id,
+        worktree_matches,
+        worktree_clean: status.is_clean(),
+    })
 }
 
 async fn workspace(command: WorkspaceCommands, verbose: bool) -> Result<(), CliError> {
@@ -870,6 +913,7 @@ fn print_restore_result(result: &RestoreResult, verbose: bool) {
         "Snapshot",
         styled(accent_style(), short_id(result.snapshot_id)),
     );
+    print_field("Cursor", cursor_summary(&result.cursor, result.snapshot_id));
 
     if let Some(message) = result.snapshot.message() {
         print_field("Message", message);
@@ -956,31 +1000,289 @@ fn print_watch_snapshot_result(
     }
 }
 
-fn print_timeline(cursor: &CursorInfo, entries: &[TimelineEntry], verbose: bool) {
-    match cursor {
-        CursorInfo::Branch(branch) => {
-            anstream::println!("Timeline for {}", styled(accent_style(), branch));
-        }
-        CursorInfo::Workspace(workspace) => {
-            anstream::println!(
-                "Timeline for workspace {}",
-                styled(accent_style(), workspace)
-            );
-        }
-    }
+fn print_timeline_graph(cursor: &CursorInfo, graph: &PrintableTimelineGraph, verbose: bool) {
+    anstream::println!("Snapshot tree");
+    print_field("Cursor", cursor_summary(cursor, graph.current_snapshot_id));
+    print_field("Worktree", worktree_summary(graph));
+    print_field(
+        "Snapshots",
+        pluralize(graph.graph.entries.len(), "snapshot", "snapshots"),
+    );
+    anstream::println!();
 
-    for entry in entries {
-        print_timeline_entry(entry.snapshot_id, &entry.snapshot, verbose);
+    let renderer = TimelineGraphRenderer::new(graph);
+    renderer.print(verbose);
+}
+
+fn cursor_summary(cursor: &CursorInfo, snapshot_id: ObjectId) -> String {
+    let kind = match cursor {
+        CursorInfo::Branch(_) => "branch",
+        CursorInfo::Workspace(_) => "workspace",
+    };
+    format!("{kind} {} @ {}", cursor.name(), short_id(snapshot_id))
+}
+
+fn worktree_summary(graph: &PrintableTimelineGraph) -> String {
+    let mut other_matches: Vec<_> = graph
+        .worktree_matches
+        .iter()
+        .copied()
+        .filter(|snapshot_id| *snapshot_id != graph.current_snapshot_id)
+        .map(short_id)
+        .collect();
+    other_matches.sort();
+
+    if graph.worktree_clean {
+        if other_matches.is_empty() {
+            "clean at cursor".to_owned()
+        } else {
+            format!(
+                "clean at cursor; same tree also at {}",
+                other_matches.join(", ")
+            )
+        }
+    } else if graph.worktree_matches.is_empty() {
+        format!(
+            "dirty; tree {} is not a saved snapshot",
+            short_id(graph.worktree_root_tree_id)
+        )
+    } else {
+        format!("matches {}", other_matches.join(", "))
     }
 }
 
-fn print_timeline_entry(snapshot_id: ObjectId, snapshot: &Snapshot, verbose: bool) {
-    let dot = styled(timeline_style(), "●");
-    let id = styled(accent_style(), short_id(snapshot_id));
-    anstream::println!("{dot} {id}  {}", timeline_title(snapshot));
+struct TimelineGraphRenderer<'a> {
+    graph: &'a PrintableTimelineGraph,
+    entries: BTreeMap<ObjectId, &'a TimelineEntry>,
+    children: BTreeMap<ObjectId, Vec<ObjectId>>,
+    roots: Vec<ObjectId>,
+    ref_labels: BTreeMap<ObjectId, Vec<String>>,
+}
 
-    if verbose {
-        print_timeline_details(snapshot_id, snapshot);
+impl<'a> TimelineGraphRenderer<'a> {
+    fn new(graph: &'a PrintableTimelineGraph) -> Self {
+        let entries: BTreeMap<_, _> = graph
+            .graph
+            .entries
+            .iter()
+            .map(|entry| (entry.snapshot_id, entry))
+            .collect();
+        let mut children: BTreeMap<ObjectId, Vec<ObjectId>> = BTreeMap::new();
+        let mut has_parent = BTreeSet::new();
+
+        for entry in &graph.graph.entries {
+            if let Some(parent) = entry.snapshot.parents().first()
+                && entries.contains_key(parent)
+            {
+                children.entry(*parent).or_default().push(entry.snapshot_id);
+                has_parent.insert(entry.snapshot_id);
+            }
+        }
+
+        for children in children.values_mut() {
+            children.sort_by_key(|id| {
+                let entry = entries.get(id).expect("child entry should exist");
+                (entry.snapshot.timestamp_millis(), *id)
+            });
+        }
+
+        let mut roots: Vec<_> = entries
+            .keys()
+            .copied()
+            .filter(|snapshot_id| !has_parent.contains(snapshot_id))
+            .collect();
+        roots.sort_by_key(|id| {
+            let entry = entries.get(id).expect("root entry should exist");
+            (entry.snapshot.timestamp_millis(), *id)
+        });
+
+        let mut ref_labels: BTreeMap<ObjectId, Vec<String>> = BTreeMap::new();
+        for branch in &graph.graph.branches {
+            ref_labels
+                .entry(branch.snapshot_id)
+                .or_default()
+                .push(branch.name.to_string());
+        }
+        for workspace in &graph.graph.workspaces {
+            ref_labels
+                .entry(workspace.snapshot_id)
+                .or_default()
+                .push(workspace.id.to_string());
+        }
+        for labels in ref_labels.values_mut() {
+            labels.sort();
+        }
+
+        Self {
+            graph,
+            entries,
+            children,
+            roots,
+            ref_labels,
+        }
+    }
+
+    fn print(&self, verbose: bool) {
+        if self.roots.is_empty() {
+            anstream::println!("(no snapshots)");
+            return;
+        }
+
+        for (index, root) in self.roots.iter().enumerate() {
+            let is_last = index + 1 == self.roots.len();
+            self.print_node_or_auto_chain(*root, "", "", is_last, verbose);
+        }
+    }
+
+    fn print_node_or_auto_chain(
+        &self,
+        snapshot_id: ObjectId,
+        prefix: &str,
+        connector: &str,
+        is_last: bool,
+        verbose: bool,
+    ) {
+        let chain = self.auto_chain(snapshot_id);
+        if chain.len() >= MIN_COLLAPSED_AUTO_SNAPSHOTS {
+            self.print_collapsed_auto_chain(&chain, prefix, connector);
+            if let Some(next) = self.only_child(*chain.last().expect("chain is not empty")) {
+                let child_prefix = child_prefix(prefix, is_last, connector.is_empty());
+                self.print_node_or_auto_chain(next, &child_prefix, "└─", true, verbose);
+            }
+            return;
+        }
+
+        self.print_node(snapshot_id, prefix, connector, verbose);
+        let child_prefix = child_prefix(prefix, is_last, connector.is_empty());
+        if let Some(children) = self.children.get(&snapshot_id) {
+            for (index, child) in children.iter().enumerate() {
+                self.print_node_or_auto_chain(
+                    *child,
+                    &child_prefix,
+                    if index + 1 == children.len() {
+                        "└─"
+                    } else {
+                        "├─"
+                    },
+                    index + 1 == children.len(),
+                    verbose,
+                );
+            }
+        }
+    }
+
+    fn print_node(&self, snapshot_id: ObjectId, prefix: &str, connector: &str, verbose: bool) {
+        let entry = self
+            .entries
+            .get(&snapshot_id)
+            .expect("timeline entry should exist");
+        let marker = styled(timeline_style(), self.marker(snapshot_id));
+        let id = styled(accent_style(), short_id(snapshot_id));
+        let annotations = self.annotations(snapshot_id, &entry.snapshot);
+        let suffix = if annotations.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", annotations.join(", "))
+        };
+        anstream::println!(
+            "{prefix}{connector}{marker} {id}  {}{suffix}",
+            timeline_title(&entry.snapshot)
+        );
+
+        if verbose {
+            print_timeline_details(snapshot_id, &entry.snapshot);
+        }
+    }
+
+    fn print_collapsed_auto_chain(&self, chain: &[ObjectId], prefix: &str, connector: &str) {
+        let first = self
+            .entries
+            .get(&chain[0])
+            .expect("chain entry should exist");
+        let last = self
+            .entries
+            .get(chain.last().expect("chain is not empty"))
+            .expect("chain entry should exist");
+        let marker = styled(timeline_style(), "…");
+        anstream::println!(
+            "{prefix}{connector}{marker} {} auto snapshots · {}–{}",
+            chain.len(),
+            format_snapshot_time(first.snapshot.timestamp_millis()),
+            format_snapshot_time(last.snapshot.timestamp_millis())
+        );
+    }
+
+    fn marker(&self, snapshot_id: ObjectId) -> &'static str {
+        let is_cursor = snapshot_id == self.graph.current_snapshot_id;
+        let is_worktree = self.graph.worktree_matches.contains(&snapshot_id);
+        match (is_cursor, is_worktree) {
+            (true, true) => "@",
+            (true, false) => "@",
+            (false, true) => "◎",
+            (false, false) => "●",
+        }
+    }
+
+    fn annotations(&self, snapshot_id: ObjectId, snapshot: &Snapshot) -> Vec<String> {
+        let mut annotations = self
+            .ref_labels
+            .get(&snapshot_id)
+            .cloned()
+            .unwrap_or_default();
+        if snapshot_id == self.graph.current_snapshot_id {
+            annotations.push("current".to_owned());
+        }
+        if self.graph.worktree_matches.contains(&snapshot_id) {
+            annotations.push("worktree".to_owned());
+        }
+        if snapshot.parents().len() > 1 {
+            annotations.push(format!("{} parents", snapshot.parents().len()));
+        }
+        annotations
+    }
+
+    fn auto_chain(&self, start: ObjectId) -> Vec<ObjectId> {
+        let mut chain = Vec::new();
+        let mut current = start;
+
+        while let Some(entry) = self.entries.get(&current) {
+            if !self.is_collapsible_auto_snapshot(current, &entry.snapshot) {
+                break;
+            }
+
+            chain.push(current);
+            let Some(next) = self.only_child(current) else {
+                break;
+            };
+            current = next;
+        }
+
+        chain
+    }
+
+    fn is_collapsible_auto_snapshot(&self, snapshot_id: ObjectId, snapshot: &Snapshot) -> bool {
+        snapshot.message().is_none()
+            && snapshot.provenance().source() == "auto-snapshot"
+            && snapshot_id != self.graph.current_snapshot_id
+            && !self.graph.worktree_matches.contains(&snapshot_id)
+            && !self.ref_labels.contains_key(&snapshot_id)
+            && snapshot.parents().len() <= 1
+            && self.children.get(&snapshot_id).map_or(0, Vec::len) <= 1
+    }
+
+    fn only_child(&self, snapshot_id: ObjectId) -> Option<ObjectId> {
+        let children = self.children.get(&snapshot_id)?;
+        (children.len() == 1).then_some(children[0])
+    }
+}
+
+fn child_prefix(prefix: &str, is_last: bool, is_root: bool) -> String {
+    if is_root {
+        String::new()
+    } else if is_last {
+        format!("{prefix}  ")
+    } else {
+        format!("{prefix}│ ")
     }
 }
 

@@ -120,6 +120,94 @@ impl LocalObjectStore {
         }
     }
 
+    /// Lists snapshot object IDs present in this local store without decoding them.
+    pub async fn list_snapshot_ids(&self) -> Result<Vec<ObjectId>, ObjectStoreError> {
+        let snapshots_dir = object_dir(&self.root, ObjectKind::Snapshot);
+        let mut ids = Vec::new();
+        let mut shards =
+            fs::read_dir(&snapshots_dir)
+                .await
+                .map_err(|source| ObjectStoreError::Io {
+                    path: snapshots_dir.clone(),
+                    source,
+                })?;
+
+        while let Some(shard) =
+            shards
+                .next_entry()
+                .await
+                .map_err(|source| ObjectStoreError::Io {
+                    path: snapshots_dir.clone(),
+                    source,
+                })?
+        {
+            let shard_path = shard.path();
+            let shard_name = shard.file_name();
+            let Some(shard_name) = shard_name.to_str() else {
+                continue;
+            };
+            if !shard
+                .file_type()
+                .await
+                .map_err(|source| ObjectStoreError::Io {
+                    path: shard_path.clone(),
+                    source,
+                })?
+                .is_dir()
+            {
+                continue;
+            }
+
+            let mut objects =
+                fs::read_dir(&shard_path)
+                    .await
+                    .map_err(|source| ObjectStoreError::Io {
+                        path: shard_path.clone(),
+                        source,
+                    })?;
+            while let Some(entry) =
+                objects
+                    .next_entry()
+                    .await
+                    .map_err(|source| ObjectStoreError::Io {
+                        path: shard_path.clone(),
+                        source,
+                    })?
+            {
+                let path = entry.path();
+                if !entry
+                    .file_type()
+                    .await
+                    .map_err(|source| ObjectStoreError::Io {
+                        path: path.clone(),
+                        source,
+                    })?
+                    .is_file()
+                {
+                    continue;
+                }
+
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if name.starts_with('.') {
+                    continue;
+                }
+                let Ok(id) = ObjectId::from_hex(name) else {
+                    continue;
+                };
+                if id.shard_prefix() == shard_name {
+                    ids.push(id);
+                }
+            }
+        }
+
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Returns the local path used to store an object.
     #[must_use]
     pub fn object_path(&self, kind: ObjectKind, id: &ObjectId) -> PathBuf {
@@ -336,6 +424,10 @@ impl ObjectStore for LocalObjectStore {
 
     async fn get_snapshot(&self, id: &ObjectId) -> Result<Snapshot, ObjectStoreError> {
         LocalObjectStore::get_snapshot(self, id).await
+    }
+
+    async fn list_snapshot_ids(&self) -> Result<Vec<ObjectId>, ObjectStoreError> {
+        LocalObjectStore::list_snapshot_ids(self).await
     }
 
     async fn contains(&self, kind: ObjectKind, id: &ObjectId) -> Result<bool, ObjectStoreError> {

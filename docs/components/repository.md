@@ -30,6 +30,7 @@ Repository code coordinates the object store and materializer, but it should not
 │ Read workflows                               │
 │  - working-tree status                       │
 │  - first-parent timeline                     │
+│  - indexed snapshot graph                    │
 │  - snapshot target resolution                │
 ├──────────────────────────────────────────────┤
 │ Workspace workflows                          │
@@ -66,6 +67,9 @@ create snapshot object
 store snapshot through object store
    │
    ▼
+record snapshot ID in repository graph index
+   │
+   ▼
 atomically advance current cursor/ref
    │
    ▼
@@ -97,25 +101,25 @@ The current file state is derived from the working directory by scanning it. The
 ## Switch and restore flow
 
 ```text
-switch or restore request
+switch request
+   │
+   ├─ safety snapshot current work if changed
+   ├─ resolve target branch
+   ├─ materialize target tree
+   └─ update current cursor/ref context
+
+restore request
+   │
+   ├─ resolve target ref or snapshot before saving dirty work
+   ├─ safety snapshot current work if changed
+   ├─ materialize target tree
+   └─ move active branch/workspace cursor to target snapshot
    │
    ▼
-safety snapshot current work if changed
-   │
-   ▼
-resolve target ref or snapshot
-   │
-   ▼
-ask materializer to materialize target tree
-   │
-   ├─ switch: update current cursor/ref context
-   └─ restore: leave current ref unchanged
-   │
-   ▼
-working directory reflects requested target
+working directory reflects requested target and future snapshots branch from it
 ```
 
-The current implementation exposes branch refs and `switch` as the repository-root named-line mechanism. External workspaces have their own refs under `.era/refs/workspaces/<id>`; switching inside such a workspace materializes the branch target and advances the workspace ref instead of changing global `HEAD`.
+The current implementation exposes branch refs and `switch` as the repository-root named-line mechanism. External workspaces have their own refs under `.era/refs/workspaces/<id>`; switching inside such a workspace materializes the branch target and advances the workspace ref instead of changing global `HEAD`. Restore keeps the active cursor identity (for example `main` or `agent-1`) but moves that cursor to the restored snapshot.
 
 ## Workspace add flow
 
@@ -142,9 +146,11 @@ A non-empty target directory is adopted as dirty relative to the base snapshot; 
 - Create snapshot objects with the correct parents and metadata.
 - Decide when changed-only snapshot requests should create or skip snapshots.
 - Save unsnapped work before context switches and restores.
-- Resolve snapshot targets by full ID, branch/workspace ref name, unique prefix, or exact label in the current timeline.
+- Resolve snapshot targets by full ID, branch/workspace ref name, unique prefix, or exact label in indexed history.
+- Maintain a lightweight snapshot graph index under `.era/index/snapshots` and rebuild it from local snapshot objects when missing.
+- Provide first-parent timelines for cursor-focused history and indexed snapshot graphs for tree renderers.
 - Provide structured results for CLI and library clients.
-- Serialize mutable ref and workspace registry updates with scoped locks while leaving object writes lock-free.
+- Serialize mutable ref, workspace registry, and index rebuild updates with scoped locks while leaving object writes lock-free.
 
 ## Boundaries
 
@@ -184,7 +190,9 @@ Those responsibilities belong to materialization, object-store, workspace-level 
 
 - Repository state is local-only.
 - The CLI can open from a repository root, a connected workspace pointer, or lazily connect the current directory with `--repo`.
-- Timeline traversal is first-parent history from the current cursor ref.
+- First-parent timeline traversal remains available from the current cursor ref.
+- Snapshot graph traversal loads snapshots from the repository-owned snapshot index, including unnamed futures left behind by restore.
+- The v0 snapshot index is a filesystem-backed ID index; richer compact graph/provenance indexes can replace it for very large histories without changing snapshot objects.
 - Branch refs remain the repository-root named-line mechanism; workspace refs are the per-directory agent mechanism.
 - Merge, garbage collection, sync, and fleet supervision are future work.
 - Workspace registry records are lightweight path metadata; watcher loops and hash caches remain outside shared repo state.

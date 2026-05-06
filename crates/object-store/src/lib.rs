@@ -34,6 +34,9 @@ pub trait ObjectStore: Send + Sync {
     /// Reads a snapshot by object ID and verifies its integrity and canonical form.
     async fn get_snapshot(&self, id: &ObjectId) -> Result<Snapshot, ObjectStoreError>;
 
+    /// Lists snapshot object IDs present in this store without decoding them.
+    async fn list_snapshot_ids(&self) -> Result<Vec<ObjectId>, ObjectStoreError>;
+
     /// Returns `true` when a valid object exists in the store.
     async fn contains(&self, kind: ObjectKind, id: &ObjectId) -> Result<bool, ObjectStoreError>;
 }

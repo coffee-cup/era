@@ -4,11 +4,14 @@ use crate::{
     refs::{
         acquire_metadata_lock, branch_lock_path, branch_ref_exists, branch_ref_path,
         create_branch_ref, create_ref_layout, create_workspace_ref, head_path, list_branch_refs,
-        list_workspace_paths, list_workspace_refs, metadata_dir, objects_dir, read_branch_ref,
-        read_head_branch, read_workspace_path, read_workspace_pointer, read_workspace_ref,
-        workspace_pointer_path, workspace_record_exists, workspace_record_lock_path,
-        workspace_ref_exists, workspace_ref_lock_path, workspace_ref_path, write_branch_ref,
-        write_head, write_workspace_path, write_workspace_pointer, write_workspace_ref,
+        list_snapshot_index_ids, list_workspace_paths, list_workspace_refs,
+        mark_snapshot_index_complete, metadata_dir, objects_dir, read_branch_ref, read_head_branch,
+        read_workspace_path, read_workspace_pointer, read_workspace_ref,
+        snapshot_index_complete_exists, snapshot_index_lock_path, workspace_pointer_path,
+        workspace_record_exists, workspace_record_lock_path, workspace_ref_exists,
+        workspace_ref_lock_path, workspace_ref_path, write_branch_ref, write_head,
+        write_snapshot_index_entry, write_workspace_path, write_workspace_pointer,
+        write_workspace_ref,
     },
     workspace::{DEFAULT_WORKSPACE_ID, WorkspacePointer},
 };
@@ -80,6 +83,7 @@ impl Repository {
         let snapshot = repository
             .capture_snapshot(materializer, request, Vec::new())
             .await?;
+        mark_snapshot_index_complete(&repository.metadata_dir).await?;
         write_head(&repository.metadata_dir, &branch).await?;
         write_branch_ref(&repository.metadata_dir, &branch, snapshot.snapshot_id).await?;
 
@@ -513,14 +517,29 @@ impl Repository {
         })
     }
 
-    /// Restores a snapshot target into the working directory without moving the current cursor.
+    /// Restores a snapshot target into the working directory and moves the current cursor to it.
     pub async fn restore(
         &self,
         materializer: &dyn Materializer,
         target: &str,
     ) -> Result<RestoreResult, RepositoryError> {
         let resolved = self.resolve_snapshot_target(target).await?;
-        let saved_snapshot = self.save_current_state_if_changed(materializer).await?;
+        let capture = self.capture_working_tree(materializer).await?;
+        let cursor = self.current_cursor_reference().await?;
+        let cursor_info = cursor.to_info();
+        let _lock = self.acquire_cursor_lock(&cursor).await?;
+        let parent = self.read_cursor_ref(&cursor).await?;
+        let parent_snapshot = self.object_store.get_snapshot(&parent).await?;
+        let saved_snapshot = if capture.root_tree_id == parent_snapshot.root_tree_id() {
+            None
+        } else {
+            let snapshot = self
+                .store_snapshot(capture, self.automatic_snapshot_request(), vec![parent])
+                .await?;
+            self.write_cursor_ref(&cursor, snapshot.snapshot_id).await?;
+            Some(snapshot)
+        };
+
         let working_directory = WorkingDirectory::new(&self.root);
         let materialization = materializer
             .materialize_tree(
@@ -529,9 +548,11 @@ impl Repository {
                 &self.object_store,
             )
             .await?;
+        self.write_cursor_ref(&cursor, resolved.snapshot_id).await?;
 
-        debug!(target, snapshot = %resolved.snapshot_id, "restored snapshot target");
+        debug!(target, cursor = cursor.as_log_value(), snapshot = %resolved.snapshot_id, "restored snapshot target and moved cursor");
         Ok(RestoreResult {
+            cursor: cursor_info,
             snapshot_id: resolved.snapshot_id,
             snapshot: resolved.snapshot,
             saved_snapshot,
@@ -589,7 +610,7 @@ impl Repository {
         let mut matches = BTreeMap::new();
         let target_is_hex_prefix =
             !target.is_empty() && target.bytes().all(|byte| byte.is_ascii_hexdigit());
-        for entry in self.timeline().await? {
+        for entry in self.all_snapshot_entries().await? {
             if target_is_hex_prefix && entry.snapshot_id.to_hex().starts_with(target) {
                 matches.insert(entry.snapshot_id, entry.snapshot.clone());
             }
@@ -656,6 +677,19 @@ impl Repository {
         Ok(entries)
     }
 
+    /// Returns every indexed snapshot, including unnamed branches of history.
+    pub async fn snapshot_graph(&self) -> Result<SnapshotGraph, RepositoryError> {
+        let branches = self.branches().await?;
+        let workspaces = self.workspaces().await?;
+        let entries = self.all_snapshot_entries().await?;
+
+        Ok(SnapshotGraph {
+            branches,
+            workspaces,
+            entries,
+        })
+    }
+
     /// Returns the path used for the current branch ref file.
     pub async fn current_branch_ref_path(&self) -> Result<PathBuf, RepositoryError> {
         let branch = self.current_branch().await?;
@@ -683,11 +717,48 @@ impl Repository {
         &self,
         materializer: &dyn Materializer,
     ) -> Result<Option<SnapshotResult>, RepositoryError> {
+        self.snapshot_if_changed(materializer, self.automatic_snapshot_request())
+            .await
+    }
+
+    fn automatic_snapshot_request(&self) -> SnapshotRequest {
         let mut request = SnapshotRequest::automatic();
         if let Some(workspace) = self.workspace_id() {
             request = request.with_provenance_attribute("workspace", workspace.as_str());
         }
-        self.snapshot_if_changed(materializer, request).await
+        request
+    }
+
+    async fn all_snapshot_entries(&self) -> Result<Vec<TimelineEntry>, RepositoryError> {
+        self.ensure_snapshot_index_complete().await?;
+        let snapshot_ids = list_snapshot_index_ids(&self.metadata_dir).await?;
+        let mut entries = Vec::with_capacity(snapshot_ids.len());
+        for snapshot_id in snapshot_ids {
+            let snapshot = self.object_store.get_snapshot(&snapshot_id).await?;
+            trace!(%snapshot_id, parents = snapshot.parents().len(), "snapshot index node loaded");
+            entries.push(TimelineEntry {
+                snapshot_id,
+                snapshot,
+            });
+        }
+        entries.sort_by_key(|entry| (entry.snapshot.timestamp_millis(), entry.snapshot_id));
+        Ok(entries)
+    }
+
+    async fn ensure_snapshot_index_complete(&self) -> Result<(), RepositoryError> {
+        if snapshot_index_complete_exists(&self.metadata_dir).await? {
+            return Ok(());
+        }
+
+        let _lock = acquire_metadata_lock(snapshot_index_lock_path(&self.metadata_dir)).await?;
+        if snapshot_index_complete_exists(&self.metadata_dir).await? {
+            return Ok(());
+        }
+
+        for snapshot_id in self.object_store.list_snapshot_ids().await? {
+            write_snapshot_index_entry(&self.metadata_dir, snapshot_id).await?;
+        }
+        mark_snapshot_index_complete(&self.metadata_dir).await
     }
 
     async fn capture_snapshot(
@@ -727,6 +798,7 @@ impl Repository {
             request.provenance,
         );
         let snapshot_id = self.object_store.put_snapshot(&snapshot).await?;
+        write_snapshot_index_entry(&self.metadata_dir, snapshot_id).await?;
 
         Ok(SnapshotResult {
             snapshot_id,
@@ -789,6 +861,13 @@ impl CursorReference {
         match self {
             Self::Branch(branch) => format!("branch:{}", branch.as_str()),
             Self::Workspace(workspace) => format!("workspace:{}", workspace.as_str()),
+        }
+    }
+
+    fn to_info(&self) -> CursorInfo {
+        match self {
+            Self::Branch(branch) => CursorInfo::Branch(branch.clone()),
+            Self::Workspace(workspace) => CursorInfo::Workspace(workspace.clone()),
         }
     }
 }
@@ -1083,6 +1162,8 @@ pub struct SwitchResult {
 /// Result returned when restoring a snapshot target.
 #[derive(Debug, Clone)]
 pub struct RestoreResult {
+    /// Cursor moved to the restored snapshot.
+    pub cursor: CursorInfo,
     /// Snapshot ID materialized into the working directory.
     pub snapshot_id: ObjectId,
     /// Snapshot materialized into the working directory.
@@ -1100,6 +1181,17 @@ pub struct ResolvedSnapshot {
     pub snapshot_id: ObjectId,
     /// Resolved snapshot contents.
     pub snapshot: Snapshot,
+}
+
+/// A graph of indexed snapshots, including unnamed branches of history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotGraph {
+    /// Branch refs included as graph heads.
+    pub branches: Vec<BranchHead>,
+    /// Workspace refs included as graph heads.
+    pub workspaces: Vec<WorkspaceHead>,
+    /// Indexed snapshot entries sorted oldest to newest.
+    pub entries: Vec<TimelineEntry>,
 }
 
 /// A timeline entry loaded from snapshot history.

@@ -66,6 +66,12 @@ async fn init_creates_metadata_layout_and_initial_snapshot() {
             .unwrap()
             .is_dir()
     );
+    assert!(
+        fs::metadata(work.join(".era/index/snapshots"))
+            .await
+            .unwrap()
+            .is_dir()
+    );
     assert_eq!(
         read_to_string(work.join(".era/HEAD")).await,
         "ref: refs/heads/main\n"
@@ -100,6 +106,22 @@ async fn init_creates_metadata_layout_and_initial_snapshot() {
             .contains(ObjectKind::Snapshot, &init.snapshot.snapshot_id)
             .await
             .unwrap()
+    );
+    assert!(
+        fs::metadata(work.join(format!(
+            ".era/index/snapshots/{}/{}",
+            init.snapshot.snapshot_id.shard_prefix(),
+            init.snapshot.snapshot_id
+        )))
+        .await
+        .unwrap()
+        .is_file()
+    );
+    assert!(
+        fs::metadata(work.join(".era/index/snapshots/.complete-v1"))
+            .await
+            .unwrap()
+            .is_file()
     );
 }
 
@@ -489,14 +511,149 @@ async fn restore_auto_saves_dirty_work_before_materializing_target() {
     let restored = repo.restore(&materializer, "two").await.unwrap();
 
     assert_eq!(restored.snapshot_id, saved_two.snapshot_id);
-    assert!(restored.saved_snapshot.is_some());
+    assert_eq!(restored.cursor, CursorInfo::Branch(BranchName::main()));
+    let safety_snapshot = restored.saved_snapshot.as_ref().expect("dirty work saved");
+    assert_eq!(safety_snapshot.snapshot.parents(), &[saved_two.snapshot_id]);
     assert_eq!(fs::read(work.join("README.md")).await.unwrap(), b"two");
+    assert_eq!(
+        repo.current_snapshot_id().await.unwrap(),
+        saved_two.snapshot_id
+    );
     assert!(
-        !repo
-            .working_tree_status(&materializer)
+        repo.working_tree_status(&materializer)
             .await
             .unwrap()
             .is_clean()
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_moves_cursor_and_next_snapshot_branches_from_restored_target() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = Repository::open(&work).await.unwrap();
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let second = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("two").with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+    fs::write(work.join("README.md"), b"three").await.unwrap();
+    let third = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("three").with_timestamp_millis(3),
+        )
+        .await
+        .unwrap();
+
+    let restored = repo.restore(&materializer, "two").await.unwrap();
+    assert_eq!(restored.snapshot_id, second.snapshot_id);
+    assert_eq!(
+        repo.current_snapshot_id().await.unwrap(),
+        second.snapshot_id
+    );
+
+    fs::write(work.join("README.md"), b"side").await.unwrap();
+    let side = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("side").with_timestamp_millis(4),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(side.snapshot.parents(), &[second.snapshot_id]);
+    assert_eq!(repo.current_snapshot_id().await.unwrap(), side.snapshot_id);
+    let graph = repo.snapshot_graph().await.unwrap();
+    let ids = graph
+        .entries
+        .iter()
+        .map(|entry| entry.snapshot_id)
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&third.snapshot_id));
+    assert!(ids.contains(&side.snapshot_id));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_moves_workspace_cursor() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let second = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("two").with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+    let workspace_path = temp.path().join("agent");
+    repo.add_workspace(
+        &materializer,
+        AddWorkspaceOptions {
+            path: workspace_path.clone(),
+            workspace_id: WorkspaceId::new("agent").unwrap(),
+            from: Some(second.snapshot_id.to_hex()),
+        },
+    )
+    .await
+    .unwrap();
+    let workspace_repo = Repository::open(&workspace_path).await.unwrap();
+    fs::write(workspace_path.join("README.md"), b"agent work")
+        .await
+        .unwrap();
+    let agent = workspace_repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("agent").with_timestamp_millis(3),
+        )
+        .await
+        .unwrap();
+
+    let restored = workspace_repo.restore(&materializer, "two").await.unwrap();
+
+    assert_eq!(restored.snapshot_id, second.snapshot_id);
+    assert_eq!(
+        restored.cursor,
+        CursorInfo::Workspace(WorkspaceId::new("agent").unwrap())
+    );
+    assert_eq!(
+        workspace_repo.current_snapshot_id().await.unwrap(),
+        second.snapshot_id
+    );
+    assert_eq!(
+        repo.current_snapshot_id().await.unwrap(),
+        second.snapshot_id
+    );
+    let graph = repo.snapshot_graph().await.unwrap();
+    assert!(
+        graph
+            .entries
+            .iter()
+            .any(|entry| entry.snapshot_id == agent.snapshot_id)
     );
 }
 
@@ -547,6 +704,108 @@ async fn timeline_walks_first_parent_newest_to_oldest() {
     assert_eq!(timeline[0].snapshot.message(), Some("third"));
     assert_eq!(timeline[1].snapshot.message(), Some("second"));
     assert_eq!(timeline[2].snapshot.parents(), &[]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_graph_includes_branch_and_workspace_futures() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("file.txt"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+
+    fs::write(work.join("file.txt"), b"main").await.unwrap();
+    let main = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("main").with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+
+    let workspace_path = temp.path().join("agent");
+    repo.add_workspace(
+        &materializer,
+        AddWorkspaceOptions {
+            path: workspace_path.clone(),
+            workspace_id: WorkspaceId::new("agent").unwrap(),
+            from: Some(init.snapshot.snapshot_id.to_hex()),
+        },
+    )
+    .await
+    .unwrap();
+    let workspace_repo = Repository::open(&workspace_path).await.unwrap();
+    fs::write(workspace_path.join("file.txt"), b"agent")
+        .await
+        .unwrap();
+    let agent = workspace_repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("agent").with_timestamp_millis(3),
+        )
+        .await
+        .unwrap();
+
+    let graph = repo.snapshot_graph().await.unwrap();
+    let ids = graph
+        .entries
+        .iter()
+        .map(|entry| entry.snapshot_id)
+        .collect::<Vec<_>>();
+
+    assert!(ids.contains(&init.snapshot.snapshot_id));
+    assert!(ids.contains(&main.snapshot_id));
+    assert!(ids.contains(&agent.snapshot_id));
+    assert_eq!(graph.branches[0].snapshot_id, main.snapshot_id);
+    assert_eq!(graph.workspaces[0].snapshot_id, agent.snapshot_id);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_graph_rebuilds_missing_index_from_snapshot_objects() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("file.txt"), b"one").await.unwrap();
+    let materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+    fs::write(work.join("file.txt"), b"two").await.unwrap();
+    let second = repo
+        .snapshot(
+            &materializer,
+            SnapshotRequest::manual("second").with_timestamp_millis(2),
+        )
+        .await
+        .unwrap();
+    fs::remove_dir_all(work.join(".era/index")).await.unwrap();
+
+    let graph = repo.snapshot_graph().await.unwrap();
+
+    let ids = graph
+        .entries
+        .iter()
+        .map(|entry| entry.snapshot_id)
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&init.snapshot.snapshot_id));
+    assert!(ids.contains(&second.snapshot_id));
+    assert!(
+        fs::metadata(work.join(".era/index/snapshots/.complete-v1"))
+            .await
+            .unwrap()
+            .is_file()
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]

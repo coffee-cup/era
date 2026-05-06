@@ -31,10 +31,22 @@ fn init_snap_and_timeline_full_flow_uses_clean_default_output() -> Result<(), Bo
     let first_timeline_stdout = output_text(&first_timeline.get_output().stdout)?;
     assert_no_ansi(&first_timeline_stdout);
     let first_lines = lines(&first_timeline_stdout);
-    assert_eq!(first_lines.len(), 2);
-    assert_eq!(first_lines[0], "Timeline for main");
-    assert!(first_lines[1].starts_with(&format!("● {initial_snapshot}  ")));
-    assert!(first_lines[1].contains("repository init"));
+    assert_eq!(first_lines.len(), 6);
+    assert_eq!(first_lines[0], "Snapshot tree");
+    assert_eq!(
+        field_line_value(&first_timeline_stdout, "Cursor"),
+        format!("branch main @ {initial_snapshot}")
+    );
+    assert_eq!(
+        field_line_value(&first_timeline_stdout, "Worktree"),
+        "clean at cursor"
+    );
+    assert_eq!(
+        field_line_value(&first_timeline_stdout, "Snapshots"),
+        "1 snapshot"
+    );
+    assert!(first_lines[5].starts_with(&format!("@ {initial_snapshot}  ")));
+    assert!(first_lines[5].contains("repository init"));
 
     fs::create_dir(work.join("src"))?;
     fs::write(work.join("README.md"), b"hello again\n")?;
@@ -63,12 +75,24 @@ fn init_snap_and_timeline_full_flow_uses_clean_default_output() -> Result<(), Bo
     let timeline_stdout = output_text(&timeline.get_output().stdout)?;
     assert_no_ansi(&timeline_stdout);
     let timeline_lines = lines(&timeline_stdout);
-    assert_eq!(timeline_lines.len(), 3);
-    assert_eq!(timeline_lines[0], "Timeline for main");
-    assert!(timeline_lines[1].starts_with(&format!("● {second_snapshot}  ")));
-    assert!(timeline_lines[1].contains("feature checkpoint"));
-    assert!(timeline_lines[2].starts_with(&format!("● {initial_snapshot}  ")));
-    assert!(timeline_lines[2].contains("repository init"));
+    assert_eq!(timeline_lines.len(), 7);
+    assert_eq!(timeline_lines[0], "Snapshot tree");
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Cursor"),
+        format!("branch main @ {second_snapshot}")
+    );
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Worktree"),
+        "clean at cursor"
+    );
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Snapshots"),
+        "2 snapshots"
+    );
+    assert!(timeline_lines[5].starts_with(&format!("● {initial_snapshot}  ")));
+    assert!(timeline_lines[5].contains("repository init"));
+    assert!(timeline_lines[6].starts_with(&format!("└─@ {second_snapshot}  ")));
+    assert!(timeline_lines[6].contains("feature checkpoint"));
 
     Ok(())
 }
@@ -122,17 +146,11 @@ fn verbose_output_includes_full_snapshot_details() -> Result<(), Box<dyn Error>>
 
     let timeline = era(work).args(["timeline", "--verbose"]).assert().success();
     let timeline_stdout = output_text(&timeline.get_output().stdout)?;
-    assert!(timeline_stdout.contains("Timeline for main\n"));
+    assert!(timeline_stdout.contains("Snapshot tree\n"));
     assert!(timeline_stdout.contains("Full snapshot"));
     assert!(timeline_stdout.contains("Root tree"));
-    assert_eq!(
-        field_line_value(&timeline_stdout, "Source"),
-        "manual-snapshot"
-    );
-    assert_eq!(
-        field_line_value(&timeline_stdout, "Author"),
-        "agent@example"
-    );
+    assert!(timeline_stdout.contains("Source         manual-snapshot"));
+    assert!(timeline_stdout.contains("Author         agent@example"));
 
     Ok(())
 }
@@ -271,8 +289,41 @@ fn watch_once_saves_dirty_work_as_unlabeled_auto_snapshot() -> Result<(), Box<dy
     let timeline = era(work).arg("timeline").assert().success();
     let timeline_stdout = output_text(&timeline.get_output().stdout)?;
     let timeline_lines = lines(&timeline_stdout);
-    assert_eq!(timeline_lines[0], "Timeline for main");
-    assert!(timeline_lines[1].starts_with(&format!("● {saved_snapshot}  auto snapshot · ")));
+    assert_eq!(timeline_lines[0], "Snapshot tree");
+    assert!(timeline_stdout.contains(&format!("└─@ {saved_snapshot}  auto snapshot · ")));
+
+    Ok(())
+}
+
+#[test]
+fn timeline_collapses_linear_auto_snapshot_spam() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
+    era(work).arg("init").assert().success();
+
+    let mut current_snapshot = String::new();
+    for index in 0..4 {
+        fs::write(work.join("README.md"), format!("auto {index}"))?;
+        let watch = era(work).args(["watch", "--once"]).assert().success();
+        let watch_stdout = output_text(&watch.get_output().stdout)?;
+        current_snapshot = watch_stdout
+            .lines()
+            .next()
+            .and_then(|line| line.strip_prefix("Saved auto snapshot "))
+            .expect("watch should save a snapshot")
+            .to_owned();
+    }
+
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+
+    assert!(timeline_stdout.contains("… 3 auto snapshots · "));
+    assert!(timeline_stdout.contains(&format!("└─@ {current_snapshot}  auto snapshot · ")));
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Snapshots"),
+        "5 snapshots"
+    );
 
     Ok(())
 }
@@ -452,6 +503,198 @@ fn branch_switch_and_restore_report_clear_errors() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn restore_moves_cursor_to_restored_snapshot() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
+    era(work).arg("init").assert().success();
+
+    fs::write(work.join("README.md"), b"two")?;
+    let second = era(work).args(["snap", "two"]).assert().success();
+    let second_stdout = output_text(&second.get_output().stdout)?;
+    let second_snapshot = field_line_value(&second_stdout, "Snapshot").to_owned();
+
+    fs::write(work.join("README.md"), b"three")?;
+    let third = era(work).args(["snap", "three"]).assert().success();
+    let third_stdout = output_text(&third.get_output().stdout)?;
+    let third_snapshot = field_line_value(&third_stdout, "Snapshot").to_owned();
+
+    let restore = era(work).args(["restore", "two"]).assert().success();
+    let restore_stdout = output_text(&restore.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&restore_stdout, "Cursor"),
+        format!("branch main @ {second_snapshot}")
+    );
+
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Cursor"),
+        format!("branch main @ {second_snapshot}")
+    );
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Worktree"),
+        "clean at cursor"
+    );
+    assert!(timeline_stdout.contains(&format!(
+        "@ {second_snapshot}  two  main, current, worktree"
+    )));
+    assert!(timeline_stdout.contains(&format!("● {third_snapshot}  three")));
+
+    Ok(())
+}
+
+#[test]
+fn restore_then_snap_branches_from_restored_snapshot() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
+    era(work).arg("init").assert().success();
+
+    fs::write(work.join("README.md"), b"two")?;
+    let second = era(work).args(["snap", "two"]).assert().success();
+    let second_stdout = output_text(&second.get_output().stdout)?;
+    let second_snapshot = field_line_value(&second_stdout, "Snapshot").to_owned();
+
+    fs::write(work.join("README.md"), b"three")?;
+    let third = era(work).args(["snap", "three"]).assert().success();
+    let third_stdout = output_text(&third.get_output().stdout)?;
+    let third_snapshot = field_line_value(&third_stdout, "Snapshot").to_owned();
+
+    era(work).args(["restore", "two"]).assert().success();
+    fs::write(work.join("README.md"), b"side")?;
+    let side = era(work).args(["snap", "side"]).assert().success();
+    let side_stdout = output_text(&side.get_output().stdout)?;
+    let side_snapshot = field_line_value(&side_stdout, "Snapshot").to_owned();
+
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Cursor"),
+        format!("branch main @ {side_snapshot}")
+    );
+    assert!(timeline_stdout.contains(&format!("● {second_snapshot}  two")));
+    assert!(timeline_stdout.contains(&format!("├─● {third_snapshot}  three")));
+    assert!(timeline_stdout.contains(&format!(
+        "└─@ {side_snapshot}  side  main, current, worktree"
+    )));
+
+    Ok(())
+}
+
+#[test]
+fn restore_saves_dirty_work_before_moving_cursor() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
+    era(work).arg("init").assert().success();
+    let status = era(work).arg("status").assert().success();
+    let status_stdout = output_text(&status.get_output().stdout)?;
+    let initial_snapshot = field_line_value(&status_stdout, "Snapshot").to_owned();
+
+    fs::write(work.join("README.md"), b"two")?;
+    era(work).args(["snap", "two"]).assert().success();
+    fs::write(work.join("README.md"), b"three unsnapped")?;
+
+    let restore = era(work)
+        .args(["--verbose", "restore", &initial_snapshot])
+        .assert()
+        .success();
+    let restore_stdout = output_text(&restore.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&restore_stdout, "Cursor"),
+        format!("branch main @ {initial_snapshot}")
+    );
+    assert!(restore_stdout.contains("Saved current work\n"));
+    assert_eq!(field_line_value(&restore_stdout, "Source"), "auto-snapshot");
+    assert_eq!(field_line_value(&restore_stdout, "trigger"), "safety");
+    assert_eq!(fs::read(work.join("README.md"))?, b"one");
+
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Cursor"),
+        format!("branch main @ {initial_snapshot}")
+    );
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Worktree"),
+        "clean at cursor"
+    );
+    assert_eq!(
+        field_line_value(&timeline_stdout, "Snapshots"),
+        "3 snapshots"
+    );
+    let safety_snapshot = timeline_stdout
+        .lines()
+        .find(|line| line.contains("auto snapshot · "))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .expect("timeline should show safety snapshot")
+        .to_owned();
+
+    era(work)
+        .args(["restore", &safety_snapshot])
+        .assert()
+        .success();
+    assert_eq!(fs::read(work.join("README.md"))?, b"three unsnapped");
+
+    Ok(())
+}
+
+#[test]
+fn workspace_restore_moves_workspace_cursor_without_switching_branch() -> Result<(), Box<dyn Error>>
+{
+    let temp = TempDir::new()?;
+    let project = temp.path().join("project");
+    let agent = temp.path().join("agent");
+    fs::create_dir(&project)?;
+    fs::write(project.join("README.md"), b"one")?;
+    era(&project).arg("init").assert().success();
+
+    fs::write(project.join("README.md"), b"two")?;
+    let second = era(&project).args(["snap", "two"]).assert().success();
+    let second_stdout = output_text(&second.get_output().stdout)?;
+    let second_snapshot = field_line_value(&second_stdout, "Snapshot").to_owned();
+
+    era(&project)
+        .args(["workspace", "add", agent.to_str().unwrap(), "--from", "two"])
+        .assert()
+        .success();
+    fs::write(agent.join("README.md"), b"agent work")?;
+    let agent_snap = era(&agent).args(["snap", "agent work"]).assert().success();
+    let agent_stdout = output_text(&agent_snap.get_output().stdout)?;
+    let agent_snapshot = field_line_value(&agent_stdout, "Snapshot").to_owned();
+
+    let restore = era(&agent).args(["restore", "two"]).assert().success();
+    let restore_stdout = output_text(&restore.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&restore_stdout, "Cursor"),
+        format!("workspace agent @ {second_snapshot}")
+    );
+
+    let agent_timeline = era(&agent).arg("timeline").assert().success();
+    let agent_timeline_stdout = output_text(&agent_timeline.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&agent_timeline_stdout, "Cursor"),
+        format!("workspace agent @ {second_snapshot}")
+    );
+    assert!(agent_timeline_stdout.contains(&format!(
+        "@ {second_snapshot}  two  agent, main, current, worktree"
+    )));
+    assert!(agent_timeline_stdout.contains(&format!("● {agent_snapshot}  agent work")));
+
+    let project_timeline = era(&project).arg("timeline").assert().success();
+    let project_timeline_stdout = output_text(&project_timeline.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&project_timeline_stdout, "Cursor"),
+        format!("branch main @ {second_snapshot}")
+    );
+
+    Ok(())
+}
+
+#[test]
 fn snap_without_label_saves_only_when_files_changed() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let work = temp.path();
@@ -464,7 +707,7 @@ fn snap_without_label_saves_only_when_files_changed() -> Result<(), Box<dyn Erro
 
     let timeline = era(work).arg("timeline").assert().success();
     let timeline_stdout = output_text(&timeline.get_output().stdout)?;
-    assert_eq!(lines(&timeline_stdout).len(), 2);
+    assert_eq!(lines(&timeline_stdout).len(), 6);
 
     fs::write(work.join("README.md"), b"two")?;
     let snap = era(work).arg("snap").assert().success();
@@ -480,8 +723,8 @@ fn snap_without_label_saves_only_when_files_changed() -> Result<(), Box<dyn Erro
     let timeline = era(work).arg("timeline").assert().success();
     let timeline_stdout = output_text(&timeline.get_output().stdout)?;
     let timeline_lines = lines(&timeline_stdout);
-    assert_eq!(timeline_lines.len(), 3);
-    assert!(timeline_lines[1].contains("snapshot · "));
+    assert_eq!(timeline_lines.len(), 7);
+    assert!(timeline_lines[6].contains("snapshot · "));
     Ok(())
 }
 

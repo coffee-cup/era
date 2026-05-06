@@ -18,7 +18,7 @@ The CLI should stay thin. Durable behavior belongs in the repository, materializ
 │  - switch                                    │
 │  - restore                                   │
 │  - watch                                     │
-│  - timeline                                  │
+│  - timeline snapshot-tree view               │
 │  - workspace add/list                        │
 ├──────────────────────────────────────────────┤
 │ Output rendering                             │
@@ -75,6 +75,24 @@ print snapshot result
 
 `era snap` without a label is intentionally rapid-fire and changed-only. Agents can call it after each tool action without worrying about duplicate snapshots. `era snap "label"` and `era snap --message "..."` are convenience forms for making a state easy to find by name. `snap`, `status`, `restore`, `watch`, and `timeline` accept `--repo REPO --workspace ID` to lazily connect the current directory to a shared repository before running; when `--workspace` is omitted in that mode, the directory basename is used.
 
+## Restore flow
+
+```text
+era restore TARGET
+   │
+   ▼
+resolve TARGET to a snapshot
+   │
+   ├─ save dirty current files as an automatic safety snapshot
+   ├─ materialize TARGET into the working directory
+   └─ move the active branch/workspace cursor to TARGET
+   │
+   ▼
+print restored snapshot and cursor position
+```
+
+Restore intentionally keeps the active cursor identity. Running `era restore feature` while on `main` moves `main` to feature's snapshot; it does not switch the command context to the `feature` branch.
+
 ## Workspace add flow
 
 ```text
@@ -112,6 +130,23 @@ print snapshot activity and continue foreground loop
 ```
 
 Watch snapshots carry structured provenance such as trigger, workspace, agent, task, and model when provided by the caller.
+
+## Timeline flow
+
+```text
+era timeline
+   │
+   ▼
+open current repository/workspace
+   │
+   ├─ load snapshots from the repository snapshot index
+   ├─ compare the working directory against the current cursor
+   ├─ mark the cursor snapshot and any snapshots with matching root trees
+   └─ render an undo-tree-style snapshot tree
+      └─ collapse long linear runs of unlabeled automatic snapshots
+```
+
+Timeline output is intentionally graph-shaped instead of a raw first-parent log. It shows where the current cursor will attach future snapshots and, separately, which saved snapshot(s) match the files on disk. Because the tree is index-backed, previous futures remain visible after `restore` moves a cursor backward. This keeps watch-heavy histories readable without explicit paging flags.
 
 ## Responsibilities
 
@@ -166,6 +201,7 @@ The library APIs remain the primary integration surface.
 - One-shot commands construct fresh materializer instances, so hash-cache reuse primarily benefits long-running watch sessions.
 - Branch/switch commands expose the repository-root branch-ref implementation.
 - `workspace add` and `workspace list` exist, but background daemons and fleet supervision are future work.
+- `timeline` renders the indexed snapshot graph and collapses linear unlabeled auto-snapshot runs; richer filtering and compact graph/provenance indexes are future work.
 
 ## Future seams
 

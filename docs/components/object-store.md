@@ -14,6 +14,7 @@ The object store is deliberately unaware of refs, workspace cursors, working dir
 │  - put/get blobs                             │
 │  - put/get trees                             │
 │  - put/get snapshots                         │
+│  - list snapshot IDs for index rebuilds      │
 │  - contains checks                           │
 ├──────────────────────────────────────────────┤
 │ Local object store implementation            │
@@ -76,6 +77,7 @@ return verified object
 - Deduplicate identical object bytes.
 - Verify object integrity on reads.
 - Preserve deterministic tree and snapshot encodings provided by the core model.
+- List snapshot object IDs so repository-owned graph indexes can be rebuilt from local objects.
 - Expose an async capability interface for higher layers.
 
 ## Boundaries
@@ -110,13 +112,14 @@ Those decisions are made above this layer.
 └───────────────────────┘
 ```
 
-Materialization writes blobs and trees while capturing a working directory. Repository writes snapshots and reads historical objects while serving status, timeline, context switching, and restore operations.
+Materialization writes blobs and trees while capturing a working directory. Repository writes snapshots, indexes snapshot IDs, and reads historical objects while serving status, timeline, context switching, and restore operations. If the repository snapshot index is missing, repository code asks the local object store for snapshot IDs and rebuilds index metadata above this layer.
 
 ## v0 constraints
 
 - The implemented store is local filesystem-backed.
 - Objects are grouped by kind and sharded by object ID prefix.
 - Blobs are whole-file objects; there is no block-level chunking or delta compression.
+- Snapshot ID listing is used for local index rebuilds; query planning and graph policy remain repository responsibilities.
 - Garbage collection, network sync, encryption, and remote storage are outside v0.
 
 ## Future seams

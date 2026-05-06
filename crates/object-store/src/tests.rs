@@ -339,6 +339,35 @@ async fn identical_snapshots_share_an_object_file() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn list_snapshot_ids_returns_stored_snapshot_objects() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let first_snapshot = sample_snapshot();
+    let first = store.put_snapshot(&first_snapshot).await.unwrap();
+    let second_snapshot = Snapshot::new(
+        sample_tree().id(),
+        vec![first],
+        2,
+        None,
+        Some("second".to_owned()),
+        SnapshotProvenance::manual(),
+    );
+    let second = store.put_snapshot(&second_snapshot).await.unwrap();
+    let temp_path = store
+        .root()
+        .join("snapshots")
+        .join(first.shard_prefix())
+        .join(format!(".{first}.tmp"));
+    fs::write(temp_path, b"temporary write").await.unwrap();
+
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(store.list_snapshot_ids().await.unwrap(), expected);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn missing_snapshot_returns_clear_error() {
     let temp = TempDir::new().unwrap();
     let store = LocalObjectStore::open(temp.path().join("objects"))
@@ -451,6 +480,7 @@ async fn object_store_trait_object_round_trips_all_object_kinds() {
             .await
             .unwrap()
     );
+    assert_eq!(store.list_snapshot_ids().await.unwrap(), vec![snapshot_id]);
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -41,13 +41,15 @@ era snap "known good"
 era timeline
 ```
 
-Go back to a previous state by label, branch/workspace name, full snapshot ID, or unique ID prefix:
+Restore files from a previous state by label, branch/workspace name, full snapshot ID, or unique ID prefix:
 
 ```sh
 era restore "known good"
 era restore main
 era restore abc123
 ```
+
+`restore` first saves any dirty working tree as an automatic safety snapshot, then materializes the requested tree and moves the current branch/workspace cursor to it. Later snapshots branch from the restored point.
 
 Keep dense local history while editing:
 
@@ -121,7 +123,8 @@ The implemented foundation covers:
 - Async local blob/tree/snapshot object storage.
 - Working-directory capture, scan, comparison, and restore.
 - Path-aware status with added, modified, deleted, and type-changed paths.
-- Local branch refs, workspace refs, branch/workspace switching, and snapshot restore.
+- Local branch refs, workspace refs, branch/workspace switching, and cursor-moving snapshot restore.
+- Snapshot-tree timeline rendering over indexed history with cursor/worktree markers and automatic collapse of long auto-snapshot runs.
 - `era workspace add` / `era workspace list` for many materialized workspaces sharing one `.era/objects` tree.
 - Scoped metadata locks and atomic ref updates so concurrent agents can snapshot different workspaces safely.
 - Changed-only unlabeled snapshots plus optional labels for important states.
@@ -205,7 +208,9 @@ era timeline --repo ../project --workspace agent-1
 
 `era workspace add PATH` is the single command for creating a missing workspace directory, connecting an empty directory, or adopting a non-empty directory as dirty relative to the inferred base snapshot. By default it infers the repository from the current repository/workspace, infers the workspace ID from the target directory name, uses the current saved state as the base, and rejects nested workspaces inside another workspace. Use `--from TARGET` to start from a specific branch, workspace, label, ID, or unique ID prefix.
 
-`era branch` lists or creates branch refs, and `era switch` saves current work before switching refs. These commands expose the current v0 repository-root cursor implementation; connected workspaces use workspace refs. `era restore` saves current work before restoring a snapshot ID, unique ID prefix, branch/workspace name, or exact snapshot label.
+`era branch` lists or creates branch refs, and `era switch` saves current work before switching refs. These commands expose the current v0 repository-root cursor implementation; connected workspaces use workspace refs. `era restore` saves current work before materializing a snapshot ID, unique ID prefix, branch/workspace name, or exact snapshot label, then moves the active branch/workspace cursor to that snapshot so later snapshots branch from the restored point.
+
+`era timeline` renders the indexed snapshot tree, oldest to newest, with `@` marking the current cursor and `◎` marking saved snapshots whose tree matches the working directory. History that no branch or workspace currently names remains visible, so restoring an old snapshot does not hide the previous future. Long linear runs of unlabeled automatic snapshots are collapsed automatically so watch-heavy histories stay readable.
 
 `era watch` runs in the foreground, treats filesystem events as hints, debounces edits, periodically reconciles the full tree, and creates unlabeled automatic snapshots only when the tree changed. Watch snapshots record structured provenance such as trigger, workspace, agent, task, and model; timeline output renders their timestamp as a synthetic title instead of storing a label.
 

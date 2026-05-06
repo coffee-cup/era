@@ -23,6 +23,9 @@ const HEADS_DIR_NAME: &str = "heads";
 const WORKSPACE_REFS_DIR_NAME: &str = "workspaces";
 const WORKSPACES_DIR_NAME: &str = "workspaces";
 const WORKSPACE_PATH_FILE_NAME: &str = "path";
+const INDEX_DIR_NAME: &str = "index";
+const SNAPSHOT_INDEX_DIR_NAME: &str = "snapshots";
+const SNAPSHOT_INDEX_COMPLETE_FILE_NAME: &str = ".complete-v1";
 const LOCKS_DIR_NAME: &str = "locks";
 const HEAD_PREFIX: &str = "ref: ";
 const REFS_HEADS_PREFIX: &str = "refs/heads/";
@@ -41,6 +44,24 @@ pub(crate) fn metadata_dir(root: &Path) -> PathBuf {
 
 pub(crate) fn objects_dir(metadata_dir: &Path) -> PathBuf {
     metadata_dir.join(OBJECTS_DIR_NAME)
+}
+
+pub(crate) fn index_dir(metadata_dir: &Path) -> PathBuf {
+    metadata_dir.join(INDEX_DIR_NAME)
+}
+
+pub(crate) fn snapshot_index_dir(metadata_dir: &Path) -> PathBuf {
+    index_dir(metadata_dir).join(SNAPSHOT_INDEX_DIR_NAME)
+}
+
+pub(crate) fn snapshot_index_entry_path(metadata_dir: &Path, snapshot_id: ObjectId) -> PathBuf {
+    snapshot_index_dir(metadata_dir)
+        .join(snapshot_id.shard_prefix())
+        .join(snapshot_id.to_string())
+}
+
+pub(crate) fn snapshot_index_complete_path(metadata_dir: &Path) -> PathBuf {
+    snapshot_index_dir(metadata_dir).join(SNAPSHOT_INDEX_COMPLETE_FILE_NAME)
 }
 
 pub(crate) fn head_path(metadata_dir: &Path) -> PathBuf {
@@ -104,11 +125,19 @@ pub(crate) fn workspace_record_lock_path(metadata_dir: &Path, workspace: &Worksp
         .join(format!("{}.lock", workspace.as_str()))
 }
 
+pub(crate) fn snapshot_index_lock_path(metadata_dir: &Path) -> PathBuf {
+    metadata_dir
+        .join(LOCKS_DIR_NAME)
+        .join(INDEX_DIR_NAME)
+        .join(format!("{SNAPSHOT_INDEX_DIR_NAME}.lock"))
+}
+
 pub(crate) async fn create_ref_layout(metadata_dir: &Path) -> Result<(), RepositoryError> {
     for directory in [
         branch_refs_dir(metadata_dir),
         workspace_refs_dir(metadata_dir),
         workspaces_dir(metadata_dir),
+        snapshot_index_dir(metadata_dir),
         metadata_dir.join(LOCKS_DIR_NAME),
     ] {
         fs::create_dir_all(&directory)
@@ -206,6 +235,100 @@ pub(crate) async fn list_branch_refs(
 
     branches.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
     Ok(branches)
+}
+
+pub(crate) async fn write_snapshot_index_entry(
+    metadata_dir: &Path,
+    snapshot_id: ObjectId,
+) -> Result<(), RepositoryError> {
+    let path = snapshot_index_entry_path(metadata_dir, snapshot_id);
+    write_text_file_atomic(&path, &format!("{snapshot_id}\n")).await
+}
+
+pub(crate) async fn mark_snapshot_index_complete(
+    metadata_dir: &Path,
+) -> Result<(), RepositoryError> {
+    write_text_file_atomic(
+        &snapshot_index_complete_path(metadata_dir),
+        "era-snapshot-index-v1\n",
+    )
+    .await
+}
+
+pub(crate) async fn snapshot_index_complete_exists(
+    metadata_dir: &Path,
+) -> Result<bool, RepositoryError> {
+    let path = snapshot_index_complete_path(metadata_dir);
+    fs::try_exists(&path)
+        .await
+        .map_err(|source| io_error(path, source))
+}
+
+pub(crate) async fn list_snapshot_index_ids(
+    metadata_dir: &Path,
+) -> Result<Vec<ObjectId>, RepositoryError> {
+    let root = snapshot_index_dir(metadata_dir);
+    if !fs::try_exists(&root)
+        .await
+        .map_err(|source| io_error(root.clone(), source))?
+    {
+        return Ok(Vec::new());
+    }
+
+    let mut ids = Vec::new();
+    let mut shards = fs::read_dir(&root)
+        .await
+        .map_err(|source| io_error(root.clone(), source))?;
+    while let Some(shard) = shards
+        .next_entry()
+        .await
+        .map_err(|source| io_error(root.clone(), source))?
+    {
+        let shard_path = shard.path();
+        if !shard
+            .file_type()
+            .await
+            .map_err(|source| io_error(shard_path.clone(), source))?
+            .is_dir()
+        {
+            continue;
+        }
+
+        let mut entries = fs::read_dir(&shard_path)
+            .await
+            .map_err(|source| io_error(shard_path.clone(), source))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| io_error(shard_path.clone(), source))?
+        {
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .await
+                .map_err(|source| io_error(path.clone(), source))?
+                .is_file()
+            {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(snapshot_id) = ObjectId::from_hex(name) else {
+                continue;
+            };
+            ids.push(snapshot_id);
+        }
+    }
+
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 pub(crate) async fn create_workspace_ref(
