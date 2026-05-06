@@ -29,6 +29,17 @@ pub trait Materializer: Send + Sync {
         object_store: &dyn ObjectStore,
     ) -> Result<CaptureResult, MaterializationError>;
 
+    /// Captures the working directory, allowing implementations to reuse trusted change hints.
+    async fn capture_tree_with_hints(
+        &self,
+        working_directory: &WorkingDirectory,
+        object_store: &dyn ObjectStore,
+        hints: &[PathBuf],
+    ) -> Result<CaptureResult, MaterializationError> {
+        let _ = hints;
+        self.capture_tree(working_directory, object_store).await
+    }
+
     /// Scans the current working directory and returns the tree ID it would capture.
     async fn scan_tree(
         &self,
@@ -302,7 +313,7 @@ pub struct TreeScanStats {
     pub ignored_entries: usize,
     /// Symlink entries skipped by [`SymlinkPolicy::Skip`].
     pub symlinks_skipped: usize,
-    /// File hashes reused from the in-memory hash cache.
+    /// File hashes reused from the capture cache.
     pub hash_cache_hits: usize,
     /// File hashes read from disk because no reusable cache entry existed.
     pub hash_cache_misses: usize,
@@ -353,7 +364,7 @@ pub struct CaptureStats {
     pub ignored_entries: usize,
     /// Symlink entries skipped by [`SymlinkPolicy::Skip`].
     pub symlinks_skipped: usize,
-    /// File hashes reused from the in-memory hash cache.
+    /// File hashes reused from the capture cache.
     pub hash_cache_hits: usize,
     /// File hashes read from disk because no reusable cache entry existed.
     pub hash_cache_misses: usize,

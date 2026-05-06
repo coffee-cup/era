@@ -1237,6 +1237,55 @@ async fn concurrent_snapshots_on_different_workspaces_advance_independent_cursor
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hinted_snapshot_uses_workspace_capture_cache() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"one").await.unwrap();
+    let init_materializer = FilesystemMaterializer::new();
+    let init = Repository::init(
+        &work,
+        &init_materializer,
+        SnapshotRequest::initial().with_timestamp_millis(1),
+    )
+    .await
+    .unwrap();
+    let repo = init.repository;
+    assert_eq!(
+        repo.capture_cache_path(),
+        work.join(".era/workspaces/default/cache/capture-v2.redb")
+    );
+
+    fs::write(work.join("README.md"), b"two").await.unwrap();
+    let materializer = FilesystemMaterializer::with_cache_path(repo.capture_cache_path());
+    let first = repo
+        .snapshot_if_changed(
+            &materializer,
+            SnapshotRequest::manual_unlabeled().with_timestamp_millis(2),
+        )
+        .await
+        .unwrap()
+        .expect("first edit should be saved");
+
+    fs::write(work.join("README.md"), b"three").await.unwrap();
+    let materializer = FilesystemMaterializer::with_cache_path(repo.capture_cache_path());
+    let second = repo
+        .snapshot_if_changed_with_hints(
+            &materializer,
+            SnapshotRequest::manual_unlabeled().with_timestamp_millis(3),
+            &[PathBuf::from("README.md")],
+        )
+        .await
+        .unwrap()
+        .expect("hinted edit should be saved");
+
+    assert_eq!(first.snapshot.parents(), &[init.snapshot.snapshot_id]);
+    assert_eq!(second.snapshot.parents(), &[first.snapshot_id]);
+    assert_eq!(second.capture.stats.files_seen, 1);
+    assert_eq!(second.capture.stats.bytes_read, b"three".len() as u64);
+    assert_eq!(second.capture.stats.blobs_stored, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn snapshot_request_accepts_structured_provenance() {
     let temp = TempDir::new().unwrap();
     let work = create_workdir(&temp).await;

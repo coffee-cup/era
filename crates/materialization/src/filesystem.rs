@@ -3,7 +3,7 @@ use crate::{
     MaterializationError, MaterializeResult, MaterializeStats, Materializer, SymlinkPolicy,
     TreeChange, TreeComparisonResult, TreeScanResult, TreeScanStats, WorkingDirectory,
     WorkingDirectoryWatch,
-    hash_cache::{FileFingerprint, HashCache},
+    capture_cache::{CachedDirectoryTree, CaptureCache, FileFingerprint},
 };
 use async_trait::async_trait;
 use era_core::{EntryKind, ObjectId, Tree, TreeEntry};
@@ -15,16 +15,28 @@ use std::{
     io,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
 };
 use tokio::fs;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// Copy-based filesystem materializer for ordinary working directories.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FilesystemMaterializer {
     options: CaptureOptions,
-    hash_cache: Arc<Mutex<HashCache>>,
+    cache: Arc<Mutex<CaptureCache>>,
+    cache_path: Option<PathBuf>,
+    cache_loaded: Arc<AtomicBool>,
+    cache_dirty: Arc<AtomicBool>,
+}
+
+impl Default for FilesystemMaterializer {
+    fn default() -> Self {
+        Self::with_options(CaptureOptions::default())
+    }
 }
 
 impl FilesystemMaterializer {
@@ -39,7 +51,31 @@ impl FilesystemMaterializer {
     pub fn with_options(options: CaptureOptions) -> Self {
         Self {
             options,
-            hash_cache: Arc::new(Mutex::new(HashCache::default())),
+            cache: Arc::new(Mutex::new(CaptureCache::default())),
+            cache_path: None,
+            cache_loaded: Arc::new(AtomicBool::new(true)),
+            cache_dirty: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Creates a materializer that persists its cache at `cache_path`.
+    #[must_use]
+    pub fn with_cache_path(cache_path: impl Into<PathBuf>) -> Self {
+        Self::with_options_and_cache_path(CaptureOptions::default(), cache_path)
+    }
+
+    /// Creates a materializer with explicit options and a persistent cache path.
+    #[must_use]
+    pub fn with_options_and_cache_path(
+        options: CaptureOptions,
+        cache_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            options,
+            cache: Arc::new(Mutex::new(CaptureCache::default())),
+            cache_path: Some(cache_path.into()),
+            cache_loaded: Arc::new(AtomicBool::new(false)),
+            cache_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -55,10 +91,67 @@ impl FilesystemMaterializer {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        let mut cache = self.hash_cache.lock().expect("hash cache mutex poisoned");
+        let mut cache = self.cache.lock().expect("capture cache mutex poisoned");
         for path in paths {
-            cache.invalidate_path(path.as_ref());
+            if cache.invalidate_path(path.as_ref()) {
+                self.cache_dirty.store(true, AtomicOrdering::Relaxed);
+            }
         }
+    }
+
+    async fn ensure_cache_loaded(&self) {
+        if self.cache_loaded.load(AtomicOrdering::Acquire) {
+            return;
+        }
+
+        let Some(path) = &self.cache_path else {
+            self.cache_loaded.store(true, AtomicOrdering::Release);
+            return;
+        };
+
+        let loaded = CaptureCache::load(path).await;
+        let was_loaded = self.cache_loaded.swap(true, AtomicOrdering::AcqRel);
+        if !was_loaded {
+            *self.cache.lock().expect("capture cache mutex poisoned") = loaded;
+            self.cache_dirty.store(false, AtomicOrdering::Release);
+        }
+    }
+
+    async fn save_cache_if_dirty(&self) {
+        let Some(path) = &self.cache_path else {
+            return;
+        };
+        if !self.cache_dirty.swap(false, AtomicOrdering::AcqRel) {
+            return;
+        }
+
+        let result = self
+            .cache
+            .lock()
+            .expect("capture cache mutex poisoned")
+            .flush();
+        if let Err(source) = result {
+            self.cache_dirty.store(true, AtomicOrdering::Release);
+            warn!(path = %path.display(), %source, "capture cache could not be saved");
+        }
+    }
+
+    fn load_all_cache_records(&self) {
+        if let Err(message) = self
+            .cache
+            .lock()
+            .expect("capture cache mutex poisoned")
+            .load_all()
+        {
+            warn!(%message, "capture cache records could not be loaded; continuing with misses");
+        }
+    }
+
+    fn drop_bulk_loaded_cache_records(&self) {
+        self.cache
+            .lock()
+            .expect("capture cache mutex poisoned")
+            .drop_bulk_loaded_records();
     }
 
     /// Captures the current working directory into blob and tree objects.
@@ -67,6 +160,8 @@ impl FilesystemMaterializer {
         working_directory: &WorkingDirectory,
         object_store: &dyn ObjectStore,
     ) -> Result<CaptureResult, MaterializationError> {
+        self.ensure_cache_loaded().await;
+        self.load_all_cache_records();
         let root = working_directory.root();
         debug!(root = %root.display(), "capturing working directory");
         ensure_capture_root(root).await?;
@@ -94,7 +189,55 @@ impl FilesystemMaterializer {
             "captured working directory"
         );
 
-        Ok(CaptureResult::new(root_tree_id, stats, issues))
+        let result = CaptureResult::new(root_tree_id, stats, issues);
+        self.save_cache_if_dirty().await;
+        self.drop_bulk_loaded_cache_records();
+        Ok(result)
+    }
+
+    /// Captures the working directory using trusted dirty-path hints when possible.
+    pub async fn capture_tree_with_hints(
+        &self,
+        working_directory: &WorkingDirectory,
+        object_store: &dyn ObjectStore,
+        hints: &[PathBuf],
+    ) -> Result<CaptureResult, MaterializationError> {
+        self.ensure_cache_loaded().await;
+        let root = working_directory.root();
+        debug!(root = %root.display(), hints = hints.len(), "capturing working directory with hints");
+        ensure_capture_root(root).await?;
+
+        if hints.is_empty() {
+            return self.capture_tree(working_directory, object_store).await;
+        }
+
+        let hints = normalize_hints(&self.options, hints);
+        if hints.is_empty() {
+            if let Some(root_tree) = self.cached_directory(Path::new(""))
+                && root_tree.stored
+            {
+                return Ok(CaptureResult::new(
+                    root_tree.tree_id,
+                    CaptureStats::default(),
+                    Vec::new(),
+                ));
+            }
+            return self.capture_tree(working_directory, object_store).await;
+        }
+
+        let mut stats = CaptureStats::default();
+        let mut issues = Vec::new();
+        match self
+            .capture_hinted_paths(root, &hints, object_store, &mut stats, &mut issues)
+            .await?
+        {
+            Some(root_tree_id) => {
+                let result = CaptureResult::new(root_tree_id, stats, issues);
+                self.save_cache_if_dirty().await;
+                Ok(result)
+            }
+            None => self.capture_tree(working_directory, object_store).await,
+        }
     }
 
     /// Scans the current working directory without storing objects.
@@ -102,6 +245,8 @@ impl FilesystemMaterializer {
         &self,
         working_directory: &WorkingDirectory,
     ) -> Result<TreeScanResult, MaterializationError> {
+        self.ensure_cache_loaded().await;
+        self.load_all_cache_records();
         let root = working_directory.root();
         debug!(root = %root.display(), "scanning working directory");
         ensure_capture_root(root).await?;
@@ -123,7 +268,10 @@ impl FilesystemMaterializer {
             "scanned working directory"
         );
 
-        Ok(TreeScanResult::new(root_tree_id, stats, issues))
+        let result = TreeScanResult::new(root_tree_id, stats, issues);
+        self.save_cache_if_dirty().await;
+        self.drop_bulk_loaded_cache_records();
+        Ok(result)
     }
 
     /// Compares the current working directory with a stored tree.
@@ -133,6 +281,8 @@ impl FilesystemMaterializer {
         working_directory: &WorkingDirectory,
         object_store: &dyn ObjectStore,
     ) -> Result<TreeComparisonResult, MaterializationError> {
+        self.ensure_cache_loaded().await;
+        self.load_all_cache_records();
         let root = working_directory.root();
         debug!(root = %root.display(), %saved_root_tree_id, "comparing working directory");
         ensure_capture_root(root).await?;
@@ -161,13 +311,16 @@ impl FilesystemMaterializer {
             "compared working directory"
         );
 
-        Ok(TreeComparisonResult::new(
+        let result = TreeComparisonResult::new(
             saved_root_tree_id,
             current_root_tree_id,
             state.changes,
             state.stats,
             state.issues,
-        ))
+        );
+        self.save_cache_if_dirty().await;
+        self.drop_bulk_loaded_cache_records();
+        Ok(result)
     }
 
     /// Watches the working directory and emits filesystem change hints.
@@ -175,6 +328,7 @@ impl FilesystemMaterializer {
         &self,
         working_directory: &WorkingDirectory,
     ) -> Result<WorkingDirectoryWatch, MaterializationError> {
+        self.ensure_cache_loaded().await;
         let root = working_directory.root();
         debug!(root = %root.display(), "watching working directory");
         ensure_capture_root(root).await?;
@@ -188,14 +342,20 @@ impl FilesystemMaterializer {
         working_directory: &WorkingDirectory,
         object_store: &dyn ObjectStore,
     ) -> Result<MaterializeResult, MaterializationError> {
+        self.ensure_cache_loaded().await;
         let root = working_directory.root();
         debug!(root = %root.display(), %root_tree_id, "materializing working directory");
         ensure_capture_root(root).await?;
 
-        self.invalidate_paths([PathBuf::new()]);
         let mut stats = MaterializeStats::default();
-        self.materialize_directory(root_tree_id, root.to_path_buf(), object_store, &mut stats)
-            .await?;
+        self.materialize_directory(
+            root_tree_id,
+            root.to_path_buf(),
+            PathBuf::new(),
+            object_store,
+            &mut stats,
+        )
+        .await?;
 
         debug!(
             root = %root.display(),
@@ -207,7 +367,178 @@ impl FilesystemMaterializer {
             "materialized working directory"
         );
 
-        Ok(MaterializeResult::new(stats))
+        let result = MaterializeResult::new(stats);
+        self.save_cache_if_dirty().await;
+        self.drop_bulk_loaded_cache_records();
+        Ok(result)
+    }
+
+    async fn capture_hinted_paths(
+        &self,
+        root: &Path,
+        hints: &[PathBuf],
+        object_store: &dyn ObjectStore,
+        stats: &mut CaptureStats,
+        issues: &mut Vec<CaptureIssue>,
+    ) -> Result<Option<ObjectId>, MaterializationError> {
+        let Some(root_tree) = self.cached_directory(Path::new("")) else {
+            return Ok(None);
+        };
+        if !root_tree.stored {
+            return Ok(None);
+        }
+
+        for hint in hints {
+            if hint.as_os_str().is_empty() {
+                return Ok(None);
+            }
+            if self
+                .capture_hinted_path(root, hint, object_store, stats, issues)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+        }
+
+        Ok(self
+            .cached_directory(Path::new(""))
+            .filter(|directory| directory.stored)
+            .map(|directory| directory.tree_id))
+    }
+
+    async fn capture_hinted_path(
+        &self,
+        root: &Path,
+        relative_path: &Path,
+        object_store: &dyn ObjectStore,
+        stats: &mut CaptureStats,
+        issues: &mut Vec<CaptureIssue>,
+    ) -> Result<Option<()>, MaterializationError> {
+        self.invalidate_paths([relative_path.to_path_buf()]);
+        let parent_path = relative_parent(relative_path);
+        let Some(parent_directory) = self.cached_directory(&parent_path) else {
+            return Ok(None);
+        };
+        if !parent_directory.stored {
+            return Ok(None);
+        }
+
+        let name = relative_file_name(relative_path)?;
+        let path = root.join(relative_path);
+        let replacement = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                let entry = DirectoryEntry {
+                    name: name.clone(),
+                    path: path.clone(),
+                    relative_path: relative_path.to_path_buf(),
+                    file_type,
+                };
+                if should_skip_entry(&self.options, &entry) {
+                    None
+                } else if file_type.is_dir() {
+                    let child_tree_id = self
+                        .capture_directory(
+                            path,
+                            relative_path.to_path_buf(),
+                            object_store,
+                            stats,
+                            issues,
+                        )
+                        .await?;
+                    Some(
+                        TreeEntry::tree(name.clone(), child_tree_id).map_err(|source| {
+                            MaterializationError::InvalidTreeEntry {
+                                path: root.join(relative_path),
+                                source,
+                            }
+                        })?,
+                    )
+                } else if file_type.is_file() {
+                    let id = self
+                        .capture_current_file(&entry, object_store, stats)
+                        .await?;
+                    Some(TreeEntry::blob(name.clone(), id).map_err(|source| {
+                        MaterializationError::InvalidTreeEntry {
+                            path: root.join(relative_path),
+                            source,
+                        }
+                    })?)
+                } else if file_type.is_symlink() {
+                    match self.options.symlink_policy() {
+                        SymlinkPolicy::Skip => {
+                            stats.symlinks_skipped += 1;
+                            issues.push(CaptureIssue::new(
+                                relative_path.to_path_buf(),
+                                CaptureIssueKind::SkippedSymlink,
+                            ));
+                            None
+                        }
+                        SymlinkPolicy::Error => {
+                            return Err(MaterializationError::SymlinkUnsupported { path });
+                        }
+                    }
+                } else {
+                    return Err(MaterializationError::UnsupportedFileType { path });
+                }
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => return Err(io_error(path, source)),
+        };
+
+        let entries = replace_cached_entry(parent_directory.entries, &name, replacement);
+        self.store_cached_directory_entries(&parent_path, entries);
+        self.rebuild_cached_ancestors(parent_path, object_store, stats)
+            .await
+            .map(Some)
+    }
+
+    fn rebuild_cached_ancestors<'a>(
+        &'a self,
+        start_path: PathBuf,
+        object_store: &'a dyn ObjectStore,
+        stats: &'a mut CaptureStats,
+    ) -> Pin<Box<dyn Future<Output = Result<(), MaterializationError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut current_path = start_path;
+            loop {
+                let Some(directory) = self.cached_directory(&current_path) else {
+                    return Err(MaterializationError::UnsupportedFileType { path: current_path });
+                };
+                let tree = Tree::new(directory.entries.clone()).map_err(|source| {
+                    MaterializationError::InvalidTreeEntry {
+                        path: current_path.clone(),
+                        source,
+                    }
+                })?;
+                let tree_id = tree.id();
+                if !directory.stored || directory.tree_id != tree_id {
+                    object_store.put_tree(&tree).await?;
+                    stats.trees_stored += 1;
+                }
+                self.store_cached_directory(&current_path, tree_id, tree.entries().to_vec(), true);
+
+                if current_path.as_os_str().is_empty() {
+                    return Ok(());
+                }
+
+                let parent_path = relative_parent(&current_path);
+                let Some(parent_directory) = self.cached_directory(&parent_path) else {
+                    return Err(MaterializationError::UnsupportedFileType { path: parent_path });
+                };
+                let name = relative_file_name(&current_path)?;
+                let entry = TreeEntry::tree(name.clone(), tree_id).map_err(|source| {
+                    MaterializationError::InvalidTreeEntry {
+                        path: current_path.clone(),
+                        source,
+                    }
+                })?;
+                let entries = replace_cached_entry(parent_directory.entries, &name, Some(entry));
+                self.store_cached_directory_entries(&parent_path, entries);
+                current_path = parent_path;
+            }
+        })
     }
 
     fn capture_directory<'a>(
@@ -286,8 +617,16 @@ impl FilesystemMaterializer {
                     source,
                 }
             })?;
-            let tree_id = object_store.put_tree(&tree).await?;
-            stats.trees_stored += 1;
+            let tree_id = tree.id();
+            let cached = self.cached_directory(&relative_path);
+            if !cached
+                .as_ref()
+                .is_some_and(|directory| directory.stored && directory.tree_id == tree_id)
+            {
+                object_store.put_tree(&tree).await?;
+                stats.trees_stored += 1;
+            }
+            self.store_cached_directory(&relative_path, tree_id, tree.entries().to_vec(), true);
             trace!(path = %directory_path.display(), %tree_id, entries = tree.entries().len(), "captured directory tree");
             Ok(tree_id)
         })
@@ -366,6 +705,7 @@ impl FilesystemMaterializer {
                 }
             })?;
             let tree_id = tree.id();
+            self.store_cached_directory(&relative_path, tree_id, tree.entries().to_vec(), false);
             trace!(path = %directory_path.display(), %tree_id, entries = tree.entries().len(), "scanned directory tree");
             Ok(tree_id)
         })
@@ -445,6 +785,12 @@ impl FilesystemMaterializer {
                 }
             })?;
             let current_tree_id = current_tree.id();
+            self.store_cached_directory(
+                &relative_path,
+                current_tree_id,
+                current_tree.entries().to_vec(),
+                false,
+            );
             trace!(path = %directory_path.display(), %saved_tree_id, %current_tree_id, changes = state.changes.len(), "compared directory");
             Ok(current_tree_id)
         })
@@ -685,11 +1031,11 @@ impl FilesystemMaterializer {
         &self,
         path: &Path,
         fingerprint: &FileFingerprint,
-    ) -> Option<crate::hash_cache::CachedFileHash> {
-        self.hash_cache
+    ) -> Option<crate::capture_cache::CachedFileHash> {
+        self.cache
             .lock()
-            .expect("hash cache mutex poisoned")
-            .get(path, fingerprint)
+            .expect("capture cache mutex poisoned")
+            .get_file(path, fingerprint)
     }
 
     fn store_cached_file_id(
@@ -699,16 +1045,56 @@ impl FilesystemMaterializer {
         object_id: ObjectId,
         stored: bool,
     ) {
-        self.hash_cache
+        if self
+            .cache
             .lock()
-            .expect("hash cache mutex poisoned")
-            .insert(path, fingerprint, object_id, stored);
+            .expect("capture cache mutex poisoned")
+            .insert_file(path, fingerprint, object_id, stored)
+        {
+            self.cache_dirty.store(true, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn cached_directory(&self, path: &Path) -> Option<CachedDirectoryTree> {
+        self.cache
+            .lock()
+            .expect("capture cache mutex poisoned")
+            .get_directory(path)
+    }
+
+    fn store_cached_directory(
+        &self,
+        path: &Path,
+        tree_id: ObjectId,
+        entries: Vec<TreeEntry>,
+        stored: bool,
+    ) {
+        if self
+            .cache
+            .lock()
+            .expect("capture cache mutex poisoned")
+            .insert_directory(path, tree_id, entries, stored)
+        {
+            self.cache_dirty.store(true, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn store_cached_directory_entries(&self, path: &Path, entries: Vec<TreeEntry>) {
+        if self
+            .cache
+            .lock()
+            .expect("capture cache mutex poisoned")
+            .update_directory_entries(path, entries)
+        {
+            self.cache_dirty.store(true, AtomicOrdering::Relaxed);
+        }
     }
 
     fn materialize_directory<'a>(
         &'a self,
         tree_id: ObjectId,
         directory_path: PathBuf,
+        relative_path: PathBuf,
         object_store: &'a dyn ObjectStore,
         stats: &'a mut MaterializeStats,
     ) -> Pin<Box<dyn Future<Output = Result<(), MaterializationError>> + Send + 'a>> {
@@ -721,24 +1107,102 @@ impl FilesystemMaterializer {
                 .map(|entry| entry.name().to_owned())
                 .collect::<BTreeSet<_>>();
 
-            prune_directory(&directory_path, &target_names, &self.options, stats).await?;
+            let removed_paths = prune_directory(
+                &directory_path,
+                &relative_path,
+                &target_names,
+                &self.options,
+                stats,
+            )
+            .await?;
+            if !removed_paths.is_empty() {
+                self.invalidate_paths(removed_paths);
+            }
 
             for entry in tree.entries() {
                 let path = directory_path.join(entry.name());
                 match entry.kind() {
                     EntryKind::Blob => {
-                        materialize_blob(&path, entry.id(), object_store, stats).await?;
+                        let relative_child = join_relative(&relative_path, entry.name());
+                        self.materialize_blob(
+                            &path,
+                            &relative_child,
+                            entry.id(),
+                            object_store,
+                            stats,
+                        )
+                        .await?;
                     }
                     EntryKind::Tree => {
+                        let relative_child = join_relative(&relative_path, entry.name());
                         prepare_directory(&path, stats).await?;
-                        self.materialize_directory(entry.id(), path, object_store, stats)
-                            .await?;
+                        self.materialize_directory(
+                            entry.id(),
+                            path,
+                            relative_child,
+                            object_store,
+                            stats,
+                        )
+                        .await?;
                     }
                 }
             }
 
+            self.store_cached_directory(&relative_path, tree_id, tree.entries().to_vec(), true);
             Ok(())
         })
+    }
+
+    async fn materialize_blob(
+        &self,
+        path: &Path,
+        relative_path: &Path,
+        id: ObjectId,
+        object_store: &dyn ObjectStore,
+        stats: &mut MaterializeStats,
+    ) -> Result<(), MaterializationError> {
+        if let Ok(metadata) = fs::symlink_metadata(path).await
+            && metadata.file_type().is_file()
+        {
+            let fingerprint = FileFingerprint::from_metadata(&metadata);
+            if let Some(cached) = self.cached_file_id(relative_path, &fingerprint)
+                && cached.object_id == id
+            {
+                self.store_cached_file_id(relative_path, fingerprint, id, true);
+                trace!(path = %path.display(), %id, "materialized file already matches from cache");
+                return Ok(());
+            }
+
+            let bytes = fs::read(path)
+                .await
+                .map_err(|source| io_error(path.to_path_buf(), source))?;
+            if ObjectId::from_content(&bytes) == id {
+                self.store_cached_file_id(relative_path, fingerprint, id, true);
+                trace!(path = %path.display(), %id, bytes = bytes.len(), "materialized file already matches");
+                return Ok(());
+            }
+        }
+
+        self.invalidate_paths([relative_path.to_path_buf()]);
+        prepare_file_path(path, stats).await?;
+        let bytes = object_store.get_blob(&id).await?;
+        fs::write(path, &bytes)
+            .await
+            .map_err(|source| io_error(path.to_path_buf(), source))?;
+
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| io_error(path.to_path_buf(), source))?;
+        self.store_cached_file_id(
+            relative_path,
+            FileFingerprint::from_metadata(&metadata),
+            id,
+            true,
+        );
+        stats.files_written += 1;
+        stats.bytes_written += bytes.len() as u64;
+        trace!(path = %path.display(), %id, bytes = bytes.len(), "materialized file blob");
+        Ok(())
     }
 }
 
@@ -750,6 +1214,21 @@ impl Materializer for FilesystemMaterializer {
         object_store: &dyn ObjectStore,
     ) -> Result<CaptureResult, MaterializationError> {
         FilesystemMaterializer::capture_tree(self, working_directory, object_store).await
+    }
+
+    async fn capture_tree_with_hints(
+        &self,
+        working_directory: &WorkingDirectory,
+        object_store: &dyn ObjectStore,
+        hints: &[PathBuf],
+    ) -> Result<CaptureResult, MaterializationError> {
+        FilesystemMaterializer::capture_tree_with_hints(
+            self,
+            working_directory,
+            object_store,
+            hints,
+        )
+        .await
     }
 
     async fn scan_tree(
@@ -877,11 +1356,13 @@ async fn read_directory_entries(
 
 async fn prune_directory(
     directory_path: &Path,
+    relative_path: &Path,
     target_names: &BTreeSet<String>,
     options: &CaptureOptions,
     stats: &mut MaterializeStats,
-) -> Result<(), MaterializationError> {
-    let entries = read_directory_entries(directory_path, Path::new("")).await?;
+) -> Result<Vec<PathBuf>, MaterializationError> {
+    let entries = read_directory_entries(directory_path, relative_path).await?;
+    let mut removed_paths = Vec::new();
 
     for entry in entries {
         if target_names.contains(&entry.name) {
@@ -905,33 +1386,17 @@ async fn prune_directory(
             }
         }
 
+        let relative_path = entry.relative_path.clone();
         remove_path(&entry.path, entry.file_type, stats).await?;
+        removed_paths.push(relative_path);
     }
 
-    Ok(())
+    Ok(removed_paths)
 }
 
 fn should_skip_entry(options: &CaptureOptions, entry: &DirectoryEntry) -> bool {
     entry.name == ".era"
         || (entry.file_type.is_dir() && options.excludes_directory_name(&entry.name))
-}
-
-async fn materialize_blob(
-    path: &Path,
-    id: ObjectId,
-    object_store: &dyn ObjectStore,
-    stats: &mut MaterializeStats,
-) -> Result<(), MaterializationError> {
-    prepare_file_path(path, stats).await?;
-    let bytes = object_store.get_blob(&id).await?;
-    fs::write(path, &bytes)
-        .await
-        .map_err(|source| io_error(path.to_path_buf(), source))?;
-
-    stats.files_written += 1;
-    stats.bytes_written += bytes.len() as u64;
-    trace!(path = %path.display(), %id, bytes = bytes.len(), "materialized file blob");
-    Ok(())
 }
 
 async fn prepare_file_path(
@@ -989,6 +1454,57 @@ async fn remove_path(
     stats.entries_removed += 1;
     trace!(path = %path.display(), "removed working-directory entry");
     Ok(())
+}
+
+fn normalize_hints(options: &CaptureOptions, hints: &[PathBuf]) -> Vec<PathBuf> {
+    let mut normalized = hints
+        .iter()
+        .filter(|path| !options.excludes_path(path))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let mut compacted: Vec<PathBuf> = Vec::new();
+    for path in normalized.drain(..) {
+        if compacted
+            .iter()
+            .any(|ancestor| !ancestor.as_os_str().is_empty() && path.starts_with(ancestor))
+        {
+            continue;
+        }
+        compacted.push(path);
+    }
+    compacted
+}
+
+fn replace_cached_entry(
+    mut entries: Vec<TreeEntry>,
+    name: &str,
+    replacement: Option<TreeEntry>,
+) -> Vec<TreeEntry> {
+    entries.retain(|entry| entry.name() != name);
+    if let Some(entry) = replacement {
+        entries.push(entry);
+    }
+    entries.sort_by(|left, right| left.name().as_bytes().cmp(right.name().as_bytes()));
+    entries
+}
+
+fn relative_parent(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
+}
+
+fn relative_file_name(path: &Path) -> Result<String, MaterializationError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| MaterializationError::PathNotUtf8 {
+            path: path.to_path_buf(),
+        })
 }
 
 fn join_relative(parent: &Path, name: &str) -> PathBuf {

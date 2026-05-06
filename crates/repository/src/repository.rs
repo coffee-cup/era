@@ -206,6 +206,27 @@ impl Repository {
         &self.object_store
     }
 
+    /// Returns this workspace's persistent capture-cache path.
+    #[must_use]
+    pub fn capture_cache_path(&self) -> PathBuf {
+        match &self.cursor {
+            RepositoryCursor::CurrentBranch => {
+                self.workspace_capture_cache_path(&WorkspaceId::default_id())
+            }
+            RepositoryCursor::Workspace(workspace) => self.workspace_capture_cache_path(workspace),
+        }
+    }
+
+    /// Returns a persistent capture-cache path for a registered workspace ID.
+    #[must_use]
+    pub fn workspace_capture_cache_path(&self, workspace: &WorkspaceId) -> PathBuf {
+        self.metadata_dir
+            .join("workspaces")
+            .join(workspace.as_str())
+            .join("cache")
+            .join("capture-v2.redb")
+    }
+
     /// Returns information about the mutable cursor this handle operates on.
     pub async fn cursor_info(&self) -> Result<CursorInfo, RepositoryError> {
         match self.current_cursor_reference().await? {
@@ -248,7 +269,20 @@ impl Repository {
         materializer: &dyn Materializer,
         request: SnapshotRequest,
     ) -> Result<Option<SnapshotResult>, RepositoryError> {
-        let capture = self.capture_working_tree(materializer).await?;
+        self.snapshot_if_changed_with_hints(materializer, request, &[])
+            .await
+    }
+
+    /// Captures with trusted dirty-path hints and advances only when the working tree changed.
+    pub async fn snapshot_if_changed_with_hints(
+        &self,
+        materializer: &dyn Materializer,
+        request: SnapshotRequest,
+        hints: &[PathBuf],
+    ) -> Result<Option<SnapshotResult>, RepositoryError> {
+        let capture = self
+            .capture_working_tree_with_hints(materializer, hints)
+            .await?;
         let cursor = self.current_cursor_reference().await?;
         let _lock = self.acquire_cursor_lock(&cursor).await?;
         let parent = self.read_cursor_ref(&cursor).await?;
@@ -775,9 +809,18 @@ impl Repository {
         &self,
         materializer: &dyn Materializer,
     ) -> Result<CaptureResult, RepositoryError> {
+        self.capture_working_tree_with_hints(materializer, &[])
+            .await
+    }
+
+    async fn capture_working_tree_with_hints(
+        &self,
+        materializer: &dyn Materializer,
+        hints: &[PathBuf],
+    ) -> Result<CaptureResult, RepositoryError> {
         let working_directory = WorkingDirectory::new(&self.root);
         materializer
-            .capture_tree(&working_directory, &self.object_store)
+            .capture_tree_with_hints(&working_directory, &self.object_store, hints)
             .await
             .map_err(RepositoryError::from)
     }

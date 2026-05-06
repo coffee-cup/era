@@ -156,6 +156,26 @@ fn verbose_output_includes_full_snapshot_details() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn one_shot_commands_reuse_persistent_capture_cache() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    fs::write(work.join("README.md"), b"hello\n")?;
+
+    era(work).arg("init").assert().success();
+    era(work).args(["status", "--verbose"]).assert().success();
+    let second_status = era(work).args(["status", "--verbose"]).assert().success();
+    let stdout = output_text(&second_status.get_output().stdout)?;
+
+    assert_eq!(field_line_value(&stdout, "Bytes"), "0");
+    assert_eq!(field_line_value(&stdout, "Cache hits"), "1");
+    assert!(
+        work.join(".era/workspaces/default/cache/capture-v2.redb")
+            .is_file()
+    );
+    Ok(())
+}
+
+#[test]
 fn init_reports_existing_repository_error() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let work = temp.path();

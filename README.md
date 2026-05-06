@@ -128,12 +128,12 @@ The implemented foundation covers:
 - `era workspace add` / `era workspace list` for many materialized workspaces sharing one `.era/objects` tree.
 - Scoped metadata locks and atomic ref updates so concurrent agents can snapshot different workspaces safely.
 - Changed-only unlabeled snapshots plus optional labels for important states.
-- Foreground `era watch` auto-snapshots with debounce, periodic reconciliation, and structured provenance.
-- A per-materializer in-memory hash cache for long-running watch sessions.
+- Foreground `era watch` auto-snapshots with debounce, dirty-path hinted capture, periodic reconciliation, and structured provenance.
+- Workspace-scoped indexed capture caches for one-shot commands and watch sessions.
 
 The foundation also includes a snapshot-agnostic text merge engine with structured conflicts; repository/CLI merge workflows are not wired yet.
 
-Notable future work includes persistent workspace hash caches, workspace fleet supervision, repository-level diff/merge flows, semantic merge strategies, tracking heuristics, provenance indexing/querying, and git interoperability.
+Notable future work includes object packing/deltas, garbage collection, snapshot retention policy, workspace fleet supervision, repository-level diff/merge flows, semantic merge strategies, tracking heuristics, provenance indexing/querying, and git interoperability.
 
 ## Prerequisites
 
@@ -150,6 +150,8 @@ git clone https://github.com/coffee-cup/era.git
 cd era
 mise install
 mise run ci
+mise run bench # optional local perf run
+mise run bench-large # optional 10k-file perf run
 cargo run -p era-cli --bin era -- --help
 ```
 

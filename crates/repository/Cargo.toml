@@ -13,4 +13,13 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-
 tracing = "0.1"
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3"
+
+[[bench]]
+name = "snapshot"
+harness = false
+
+[[bench]]
+name = "snapshot_large"
+harness = false

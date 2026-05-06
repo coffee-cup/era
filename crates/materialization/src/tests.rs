@@ -666,6 +666,348 @@ async fn capture_rejects_non_utf8_path_segment() {
     ));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn persistent_capture_cache_reuses_hashes_across_materializers() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("a.txt"), b"a").await.unwrap();
+    fs::create_dir(work.join("src")).await.unwrap();
+    fs::write(work.join("src/b.txt"), b"b").await.unwrap();
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+
+    let first_materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let first = first_materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    let second_materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let second = second_materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert_eq!(second.root_tree_id, first.root_tree_id);
+    assert_eq!(second.stats.files_seen, 2);
+    assert_eq!(second.stats.hash_cache_hits, 2);
+    assert_eq!(second.stats.hash_cache_misses, 0);
+    assert_eq!(second.stats.bytes_read, 0);
+    assert_eq!(second.stats.blobs_stored, 0);
+    assert_eq!(second.stats.trees_stored, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn corrupt_persistent_capture_cache_is_ignored_and_rebuilt() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"hello").await.unwrap();
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+    fs::create_dir_all(cache_path.parent().unwrap())
+        .await
+        .unwrap();
+    fs::write(&cache_path, b"not a capture cache")
+        .await
+        .unwrap();
+
+    let materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let result = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    let second = FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert_eq!(result.stats.hash_cache_misses, 1);
+    assert_eq!(second.root_tree_id, result.root_tree_id);
+    assert_eq!(second.stats.hash_cache_hits, 1);
+    assert_eq!(second.stats.bytes_read, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hinted_capture_rehashes_dirty_file_and_rebuilds_ancestors_only() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("README.md"), b"unchanged")
+        .await
+        .unwrap();
+    fs::create_dir(work.join("src")).await.unwrap();
+    fs::write(work.join("src/lib.rs"), b"old").await.unwrap();
+    fs::write(work.join("src/main.rs"), b"unchanged")
+        .await
+        .unwrap();
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+
+    FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    fs::write(work.join("src/lib.rs"), b"new contents")
+        .await
+        .unwrap();
+
+    let materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let hinted = materializer
+        .capture_tree_with_hints(
+            &WorkingDirectory::new(&work),
+            &store,
+            &[PathBuf::from("src/lib.rs")],
+        )
+        .await
+        .unwrap();
+    let scan = materializer
+        .scan_tree(&WorkingDirectory::new(&work))
+        .await
+        .unwrap();
+
+    assert_eq!(hinted.root_tree_id, scan.root_tree_id);
+    assert_eq!(hinted.stats.files_seen, 1);
+    assert_eq!(hinted.stats.bytes_read, b"new contents".len() as u64);
+    assert_eq!(hinted.stats.blobs_stored, 1);
+    assert_eq!(hinted.stats.trees_stored, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn hinted_capture_handles_add_delete_and_type_changes() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("delete.txt"), b"delete").await.unwrap();
+    fs::write(work.join("file-to-dir"), b"file").await.unwrap();
+    fs::create_dir(work.join("dir-to-file")).await.unwrap();
+    fs::write(work.join("dir-to-file/nested.txt"), b"nested")
+        .await
+        .unwrap();
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+
+    FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    fs::remove_file(work.join("delete.txt")).await.unwrap();
+    fs::write(work.join("added.txt"), b"added").await.unwrap();
+    fs::remove_file(work.join("file-to-dir")).await.unwrap();
+    fs::create_dir(work.join("file-to-dir")).await.unwrap();
+    fs::write(work.join("file-to-dir/file.txt"), b"child")
+        .await
+        .unwrap();
+    fs::remove_dir_all(work.join("dir-to-file")).await.unwrap();
+    fs::write(work.join("dir-to-file"), b"now file")
+        .await
+        .unwrap();
+
+    let materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let hinted = materializer
+        .capture_tree_with_hints(
+            &WorkingDirectory::new(&work),
+            &store,
+            &[
+                PathBuf::from("delete.txt"),
+                PathBuf::from("added.txt"),
+                PathBuf::from("file-to-dir"),
+                PathBuf::from("dir-to-file"),
+            ],
+        )
+        .await
+        .unwrap();
+    let scan = materializer
+        .scan_tree(&WorkingDirectory::new(&work))
+        .await
+        .unwrap();
+
+    assert_eq!(hinted.root_tree_id, scan.root_tree_id);
+    assert_eq!(hinted.stats.files_seen, 3);
+    assert_eq!(
+        hinted.stats.bytes_read,
+        (b"added".len() + b"child".len() + b"now file".len()) as u64
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn materialize_tree_seeds_cache_for_hinted_agent_snapshot() {
+    let temp = TempDir::new().unwrap();
+    let source = create_workdir(&temp).await;
+    fs::write(source.join("a.txt"), b"unchanged").await.unwrap();
+    fs::write(source.join("b.txt"), b"old").await.unwrap();
+    let target = temp.path().join("agent");
+    fs::create_dir(&target).await.unwrap();
+    let store = open_store(&temp).await;
+    let source_capture = FilesystemMaterializer::new()
+        .capture_tree(&WorkingDirectory::new(&source), &store)
+        .await
+        .unwrap();
+    let cache_path = temp.path().join("agent-cache/capture-v2.redb");
+
+    FilesystemMaterializer::with_cache_path(&cache_path)
+        .materialize_tree(
+            source_capture.root_tree_id,
+            &WorkingDirectory::new(&target),
+            &store,
+        )
+        .await
+        .unwrap();
+    fs::write(target.join("b.txt"), b"new").await.unwrap();
+
+    let materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let hinted = materializer
+        .capture_tree_with_hints(
+            &WorkingDirectory::new(&target),
+            &store,
+            &[PathBuf::from("b.txt")],
+        )
+        .await
+        .unwrap();
+    let scan = materializer
+        .scan_tree(&WorkingDirectory::new(&target))
+        .await
+        .unwrap();
+
+    assert_eq!(hinted.root_tree_id, scan.root_tree_id);
+    assert_eq!(hinted.stats.files_seen, 1);
+    assert_eq!(hinted.stats.bytes_read, 3);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn materialize_tree_invalidates_pruned_cached_subtrees() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("a.txt"), b"a").await.unwrap();
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+    let materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let without_dir = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    fs::create_dir(work.join("dir")).await.unwrap();
+    fs::write(work.join("dir/file.txt"), b"file").await.unwrap();
+    materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    materializer
+        .materialize_tree(
+            without_dir.root_tree_id,
+            &WorkingDirectory::new(&work),
+            &store,
+        )
+        .await
+        .unwrap();
+    let hinted = materializer
+        .capture_tree_with_hints(
+            &WorkingDirectory::new(&work),
+            &store,
+            &[PathBuf::from("dir/file.txt")],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(hinted.root_tree_id, without_dir.root_tree_id);
+    assert!(fs::metadata(work.join("dir")).await.is_err());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn materialize_tree_skips_files_that_already_match() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    fs::write(work.join("a.txt"), b"a").await.unwrap();
+    fs::write(work.join("b.txt"), b"b").await.unwrap();
+    let store = open_store(&temp).await;
+    let materializer = FilesystemMaterializer::new();
+    let captured = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    let result = materializer
+        .materialize_tree(captured.root_tree_id, &WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    assert_eq!(result.stats.files_written, 0);
+    assert_eq!(result.stats.bytes_written, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn large_capture_cache_limits_hinted_work() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    write_numbered_tree(&work, 32, 32).await;
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+
+    FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+
+    let warm = FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    assert_eq!(warm.stats.files_seen, 1024);
+    assert_eq!(warm.stats.hash_cache_hits, 1024);
+    assert_eq!(warm.stats.hash_cache_misses, 0);
+    assert_eq!(warm.stats.bytes_read, 0);
+    assert_eq!(warm.stats.blobs_stored, 0);
+    assert_eq!(warm.stats.trees_stored, 0);
+
+    let dirty_path = PathBuf::from("dir-07/file-07.txt");
+    fs::write(work.join(&dirty_path), b"changed").await.unwrap();
+    let materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+    let hinted = materializer
+        .capture_tree_with_hints(&WorkingDirectory::new(&work), &store, &[dirty_path])
+        .await
+        .unwrap();
+    assert_eq!(hinted.stats.files_seen, 1);
+    assert_eq!(hinted.stats.hash_cache_hits, 0);
+    assert_eq!(hinted.stats.hash_cache_misses, 1);
+    assert_eq!(hinted.stats.bytes_read, b"changed".len() as u64);
+    assert_eq!(hinted.stats.blobs_stored, 1);
+    assert_eq!(hinted.stats.trees_stored, 2);
+
+    let restored = materializer
+        .materialize_tree(hinted.root_tree_id, &WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    assert_eq!(restored.stats.files_written, 0);
+    assert_eq!(restored.stats.bytes_written, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn separate_workspace_cache_paths_do_not_share_file_fingerprints() {
+    let temp = TempDir::new().unwrap();
+    let first_work = temp.path().join("first");
+    let second_work = temp.path().join("second");
+    fs::create_dir(&first_work).await.unwrap();
+    fs::create_dir(&second_work).await.unwrap();
+    fs::write(first_work.join("same.txt"), b"same")
+        .await
+        .unwrap();
+    fs::write(second_work.join("same.txt"), b"same")
+        .await
+        .unwrap();
+    let store = open_store(&temp).await;
+
+    FilesystemMaterializer::with_cache_path(temp.path().join("first-cache/capture-v2.redb"))
+        .capture_tree(&WorkingDirectory::new(&first_work), &store)
+        .await
+        .unwrap();
+    let second =
+        FilesystemMaterializer::with_cache_path(temp.path().join("second-cache/capture-v2.redb"))
+            .capture_tree(&WorkingDirectory::new(&second_work), &store)
+            .await
+            .unwrap();
+
+    assert_eq!(second.stats.hash_cache_hits, 0);
+    assert_eq!(second.stats.hash_cache_misses, 1);
+}
+
 async fn create_workdir(temp: &TempDir) -> PathBuf {
     let work = temp.path().join("work");
     fs::create_dir(&work).await.unwrap();
@@ -676,6 +1018,21 @@ async fn open_store(temp: &TempDir) -> LocalObjectStore {
     LocalObjectStore::open(temp.path().join("objects"))
         .await
         .unwrap()
+}
+
+async fn write_numbered_tree(root: &Path, directories: usize, files_per_directory: usize) {
+    for directory_index in 0..directories {
+        let directory = root.join(format!("dir-{directory_index:02}"));
+        fs::create_dir(&directory).await.unwrap();
+        for file_index in 0..files_per_directory {
+            fs::write(
+                directory.join(format!("file-{file_index:02}.txt")),
+                format!("content {directory_index} {file_index}\n"),
+            )
+            .await
+            .unwrap();
+        }
+    }
 }
 
 fn entry_names(tree: &Tree) -> Vec<&str> {

@@ -12,6 +12,7 @@ This component owns working-directory filesystem behavior. Higher layers should 
 ├──────────────────────────────────────────────┤
 │ Materializer capability                      │
 │  - capture working directory                 │
+│  - capture from dirty-path hints             │
 │  - scan working directory                    │
 │  - compare with stored tree                  │
 │  - materialize stored tree                   │
@@ -21,7 +22,7 @@ This component owns working-directory filesystem behavior. Higher layers should 
 │  - copy-based local implementation           │
 │  - configurable directory exclusions         │
 │  - symlink policy                            │
-│  - per-materializer hash cache               │
+│  - workspace-scoped persistent capture cache │
 │  - filesystem watcher adapter                │
 └──────────────────────────────────────────────┘
 ```
@@ -32,11 +33,12 @@ This component owns working-directory filesystem behavior. Higher layers should 
 working directory
    │
    ▼
-walk included paths
+walk included paths, or use dirty-path hints when provided
    │
    ├─ skip excluded directories and `.era` workspace pointer files
    ├─ apply symlink policy
-   └─ reuse cached file hashes when fingerprints match
+   ├─ reuse cached file hashes when fingerprints match
+   └─ reuse cached stored tree entries for unchanged directories
    │
    ▼
 hash changed file bytes
@@ -45,10 +47,10 @@ hash changed file bytes
 store new blobs through object store
    │
    ▼
-build trees bottom-up
+build changed trees bottom-up
    │
    ▼
-store new trees through object store
+store new trees through object store and reuse cached stored trees
    │
    ▼
 return root tree ID + capture stats + issues
@@ -65,6 +67,7 @@ load trees and blobs from object store
    ▼
 compare target tree with working directory
    │
+   ├─ skip files whose bytes already match
    ├─ write missing or changed files
    ├─ create needed directories
    ├─ remove tracked paths absent from target
@@ -89,19 +92,25 @@ emit relative path hint
 higher layer invalidates affected cache entries
    │
    ▼
-higher layer debounces and reconciles full tree
+higher layer debounces and requests hinted capture
+   │
+   ▼
+periodic reconciliation still scans the full tree
 ```
 
-Filesystem watcher events are hints, not proof. The repository and CLI flows reconcile by scanning the working directory before creating snapshots.
+Filesystem watcher events are hints, not proof. Watch-triggered snapshots can use hints to avoid full walks, while periodic reconciliation scans the working directory to catch missed events.
 
 ## Responsibilities
 
 - Capture a working directory into blob and tree objects.
+- Capture from dirty-path hints when cached stored tree structure is available.
 - Scan a working directory without storing new objects when callers only need comparison.
 - Compare a working directory with a stored tree and report path-level changes.
 - Materialize a stored tree into a working directory.
 - Watch a working directory and emit filtered change hints.
-- Maintain hash-cache state scoped to one materializer instance and workspace.
+- Maintain capture-cache state scoped to one materialized workspace.
+
+The persistent cache is an indexed redb database at the workspace cache path. Full tree operations may bulk-load cache records because they already walk the filesystem, while hinted captures use point lookups/updates and prefix invalidation so one dirty path does not require decoding or rewriting the entire cache. Cache writes skip fsync-level durability because the cache is rebuildable after corruption or loss.
 
 ## Boundaries
 
@@ -138,11 +147,11 @@ Those policies belong to the repository and CLI layers.
 ## v0 constraints
 
 - The current implementation is copy-based and local-filesystem-backed.
-- Hash caching is in-memory and scoped to one materializer instance.
+- Capture caching is workspace-scoped, redb-backed when a cache path is supplied, and falls back to an in-memory cache otherwise.
 - Default tracking behavior is implemented as exact directory exclusions, preservation of `.era` metadata/pointer entries, plus symlink policy.
 - Symlinks are not followed.
 - Watchers are best-effort hints and must be paired with reconciliation.
 
 ## Future seams
 
-Hardlink, reflink, and FUSE materializers should plug into the same capability boundary. Persistent hash caches should remain workspace-scoped rather than becoming shared object-store state.
+Hardlink, reflink, and FUSE materializers should plug into the same capability boundary. Capture caches should remain workspace-scoped rather than becoming shared object-store state; global storage efficiency belongs in object-store packing, indexes, and GC.

@@ -48,7 +48,7 @@ parse arguments and global flags
 open or initialize repository/workspace in current directory
    │
    ▼
-construct filesystem materializer
+construct filesystem materializer with workspace capture cache
    │
    ▼
 call repository API
@@ -63,7 +63,7 @@ format structured result for terminal output
 era snap [optional label]
    │
    ▼
-capture current tree
+capture current tree using the workspace cache
    │
    ├─ no label and unchanged ──► print "No changes"
    ├─ no label and changed ────► create unlabeled snapshot
@@ -118,8 +118,9 @@ era watch
 start materializer watcher
    │
    ├─ receive filtered path hints
-   ├─ invalidate affected hash-cache entries
+   ├─ invalidate affected capture-cache entries
    ├─ debounce bursts of edits
+   ├─ request hinted capture for watch-triggered snapshots
    └─ periodically reconcile full tree
    │
    ▼
@@ -153,7 +154,7 @@ Timeline output is intentionally graph-shaped instead of a raw first-parent log.
 - Provide the public `era` command surface.
 - Keep command output clear, concise, and script-friendly.
 - Expose verbose diagnostics without making normal output noisy.
-- Wire repository operations to a filesystem materializer for local workflows.
+- Wire repository operations to a filesystem materializer using the current workspace capture cache.
 - Connect or lazily adopt external workspace directories through repository APIs.
 - Run the foreground watch/debounce/reconcile loop.
 - Configure tracing so diagnostics go to stderr and remain disabled unless explicitly requested.
@@ -198,7 +199,7 @@ The library APIs remain the primary integration surface.
 
 - Commands operate from a repository root or connected workspace root; parent-directory discovery remains future work.
 - The watch loop runs in the foreground.
-- One-shot commands construct fresh materializer instances, so hash-cache reuse primarily benefits long-running watch sessions.
+- One-shot commands construct fresh materializer instances backed by the workspace's persistent capture cache.
 - Branch/switch commands expose the repository-root branch-ref implementation.
 - `workspace add` and `workspace list` exist, but background daemons and fleet supervision are future work.
 - `timeline` renders the indexed snapshot graph and collapses linear unlabeled auto-snapshot runs; richer filtering and compact graph/provenance indexes are future work.

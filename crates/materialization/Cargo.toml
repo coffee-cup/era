@@ -10,8 +10,18 @@ async-trait = "0.1"
 era-core = { path = "../core" }
 era-object-store = { path = "../object-store" }
 notify = "8"
+redb = "3"
 tokio = { version = "1", features = ["fs", "macros", "rt", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3"
+
+[[bench]]
+name = "capture"
+harness = false
+
+[[bench]]
+name = "capture_large"
+harness = false

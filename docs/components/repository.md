@@ -49,6 +49,7 @@ repository operation
    ├─ collect snapshot metadata and provenance
    ▼
 ask materializer to capture current tree without holding a ref lock
+   │  └─ watch flows may pass dirty-path hints
    │
    ▼
 root tree ID
@@ -145,6 +146,7 @@ A non-empty target directory is adopted as dirty relative to the base snapshot; 
 - Manage current cursor/ref state, workspace cursors, and named references.
 - Create snapshot objects with the correct parents and metadata.
 - Decide when changed-only snapshot requests should create or skip snapshots.
+- Route trusted dirty-path hints to the materializer for watch-triggered snapshots.
 - Save unsnapped work before context switches and restores.
 - Resolve snapshot targets by full ID, branch/workspace ref name, unique prefix, or exact label in indexed history.
 - Maintain a lightweight snapshot graph index under `.era/index/snapshots` and rebuild it from local snapshot objects when missing.
@@ -159,7 +161,7 @@ Repository does not:
 - Hash file contents directly.
 - Walk, watch, or rewrite working-directory files directly.
 - Implement object storage mechanics.
-- Own per-workspace watcher loops or hash caches.
+- Own per-workspace watcher loops or capture-cache contents.
 - Render terminal output.
 
 Those responsibilities belong to materialization, object-store, workspace-level clients, and CLI code.
@@ -195,8 +197,9 @@ Those responsibilities belong to materialization, object-store, workspace-level 
 - The v0 snapshot index is a filesystem-backed ID index; richer compact graph/provenance indexes can replace it for very large histories without changing snapshot objects.
 - Branch refs remain the repository-root named-line mechanism; workspace refs are the per-directory agent mechanism.
 - Repository-level merge orchestration, garbage collection, sync, and fleet supervision are future work. The snapshot-agnostic `era-merge` file engine exists for future merge orchestration.
-- Workspace registry records are lightweight path metadata; watcher loops and hash caches remain outside shared repo state.
+- Workspace registry records are lightweight path metadata; watcher loops and capture-cache contents remain outside shared repo state.
+- Repository handles expose the current workspace redb capture-cache path under `.era/workspaces/<workspace-id>/cache/capture-v2.redb` so clients can construct cached materializers without making the cache global.
 
 ## Future seams
 
-Repository is where richer policy belongs: merge-base selection, tree merge planning, diff, tracking heuristics, provenance indexes, workspace fleet supervision, and sync coordination. File-level merge logic belongs behind the snapshot-agnostic `era-merge` adapter boundary so future snapshot storage changes do not rewrite merge strategies. Those features should preserve the boundary that shared repository state is objects, refs, graph metadata, workspace registry records, and indexes, while watcher/debounce/hash-cache state remains workspace-scoped.
+Repository is where richer policy belongs: merge-base selection, tree merge planning, diff, tracking heuristics, provenance indexes, workspace fleet supervision, and sync coordination. File-level merge logic belongs behind the snapshot-agnostic `era-merge` adapter boundary so future snapshot storage changes do not rewrite merge strategies. Those features should preserve the boundary that shared repository state is objects, refs, graph metadata, workspace registry records, and indexes, while watcher/debounce/capture-cache state remains workspace-scoped.

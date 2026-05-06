@@ -17,6 +17,20 @@ run = "cargo clippy --workspace --all-targets -- -D warnings"
 description = "Run all Rust tests"
 run = "cargo test --workspace --all-targets"
 
+[tasks.bench]
+description = "Run Rust benchmarks"
+run = [
+    "cargo bench -p era-materialization --bench capture",
+    "cargo bench -p era-repository --bench snapshot",
+]
+
+[tasks.bench-large]
+description = "Run larger 10k-file Rust benchmarks"
+run = [
+    "cargo bench -p era-materialization --bench capture_large",
+    "cargo bench -p era-repository --bench snapshot_large",
+]
+
 [tasks.ci]
 description = "Run the full local validation suite"
 run = [

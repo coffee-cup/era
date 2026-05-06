@@ -1,9 +1,9 @@
 //! Working-directory materialization and filesystem observation.
 
 mod capture;
+mod capture_cache;
 mod error;
 mod filesystem;
-mod hash_cache;
 mod watch;
 mod working_directory;
 

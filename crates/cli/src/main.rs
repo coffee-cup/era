@@ -242,8 +242,9 @@ async fn snap(
     workspace: Option<String>,
     verbose: bool,
 ) -> Result<(), CliError> {
-    let materializer = FilesystemMaterializer::new();
-    let repository = open_command_repository(&materializer, repo, workspace).await?;
+    let bootstrap_materializer = FilesystemMaterializer::new();
+    let repository = open_command_repository(&bootstrap_materializer, repo, workspace).await?;
+    let materializer = command_materializer(&repository);
     let cursor = repository.cursor_info().await?;
     let message = message.or(label);
     let has_label = message.is_some();
@@ -280,8 +281,9 @@ async fn status(
     workspace: Option<String>,
     verbose: bool,
 ) -> Result<(), CliError> {
-    let materializer = FilesystemMaterializer::new();
-    let repository = open_command_repository(&materializer, repo, workspace).await?;
+    let bootstrap_materializer = FilesystemMaterializer::new();
+    let repository = open_command_repository(&bootstrap_materializer, repo, workspace).await?;
+    let materializer = command_materializer(&repository);
     let cursor = repository.cursor_info().await?;
     let timeline = repository.timeline().await?;
     if timeline.is_empty() {
@@ -303,8 +305,8 @@ async fn status(
 }
 
 async fn branch(name: Option<String>, verbose: bool) -> Result<(), CliError> {
-    let materializer = FilesystemMaterializer::new();
     let repository = Repository::open(current_directory()?).await?;
+    let materializer = command_materializer(&repository);
 
     match name {
         Some(name) => {
@@ -323,8 +325,8 @@ async fn branch(name: Option<String>, verbose: bool) -> Result<(), CliError> {
 }
 
 async fn switch(name: String, verbose: bool) -> Result<(), CliError> {
-    let materializer = FilesystemMaterializer::new();
     let repository = Repository::open(current_directory()?).await?;
+    let materializer = command_materializer(&repository);
     let branch = BranchName::new(name).map_err(RepositoryError::from)?;
     let result = repository.switch_branch(&materializer, branch).await?;
 
@@ -339,8 +341,9 @@ async fn restore(
     workspace: Option<String>,
     verbose: bool,
 ) -> Result<(), CliError> {
-    let materializer = FilesystemMaterializer::new();
-    let repository = open_command_repository(&materializer, repo, workspace).await?;
+    let bootstrap_materializer = FilesystemMaterializer::new();
+    let repository = open_command_repository(&bootstrap_materializer, repo, workspace).await?;
+    let materializer = command_materializer(&repository);
     let result = repository.restore(&materializer, &target).await?;
 
     print_restore_result(&result, verbose);
@@ -366,9 +369,14 @@ struct WatchMetadata {
 }
 
 async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
-    let materializer = FilesystemMaterializer::new();
-    let repository =
-        open_command_repository(&materializer, args.repo, args.metadata.workspace.clone()).await?;
+    let bootstrap_materializer = FilesystemMaterializer::new();
+    let repository = open_command_repository(
+        &bootstrap_materializer,
+        args.repo,
+        args.metadata.workspace.clone(),
+    )
+    .await?;
+    let materializer = command_materializer(&repository);
 
     if args.once {
         let saved = snapshot_if_changed_for_watch(
@@ -376,6 +384,7 @@ async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
             &materializer,
             AutoSnapshotTrigger::Reconcile,
             &args.metadata,
+            &[],
         )
         .await?;
         print_watch_snapshot_result(saved.as_ref(), verbose, true);
@@ -386,6 +395,7 @@ async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
     let mut watch = materializer.watch(&working_directory).await?;
     let debounce = Duration::from_millis(args.debounce_ms);
     let mut debounce_sleep: Option<Pin<Box<Sleep>>> = None;
+    let mut dirty_paths = BTreeSet::new();
     let mut reconcile = time::interval(Duration::from_secs(args.reconcile_secs));
     reconcile.set_missed_tick_behavior(MissedTickBehavior::Skip);
     reconcile.tick().await;
@@ -397,6 +407,7 @@ async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
             event = watch.next_event() => {
                 match event {
                     Some(Ok(event)) => {
+                        dirty_paths.extend(event.paths.iter().cloned());
                         invalidate_watch_event_paths(&materializer, &event);
                         debounce_sleep = Some(Box::pin(time::sleep(debounce)));
                     }
@@ -410,13 +421,16 @@ async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
                 }
             }, if debounce_sleep.is_some() => {
                 debounce_sleep = None;
+                let hints = dirty_paths.iter().cloned().collect::<Vec<_>>();
                 let saved = snapshot_if_changed_for_watch(
                     &repository,
                     &materializer,
                     AutoSnapshotTrigger::Watch,
                     &args.metadata,
+                    &hints,
                 )
                 .await?;
+                dirty_paths.clear();
                 print_watch_snapshot_result(saved.as_ref(), verbose, false);
             }
             _ = reconcile.tick() => {
@@ -425,8 +439,10 @@ async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
                     &materializer,
                     AutoSnapshotTrigger::Reconcile,
                     &args.metadata,
+                    &[],
                 )
                 .await?;
+                dirty_paths.clear();
                 print_watch_snapshot_result(saved.as_ref(), verbose, false);
             }
             signal = tokio::signal::ctrl_c() => {
@@ -445,11 +461,13 @@ async fn snapshot_if_changed_for_watch(
     materializer: &FilesystemMaterializer,
     trigger: AutoSnapshotTrigger,
     metadata: &WatchMetadata,
+    hints: &[PathBuf],
 ) -> Result<Option<SnapshotResult>, CliError> {
     repository
-        .snapshot_if_changed(
+        .snapshot_if_changed_with_hints(
             materializer,
             auto_snapshot_request(trigger, metadata, repository),
+            hints,
         )
         .await
         .map_err(CliError::from)
@@ -490,8 +508,9 @@ async fn timeline(
     workspace: Option<String>,
     verbose: bool,
 ) -> Result<(), CliError> {
-    let materializer = FilesystemMaterializer::new();
-    let repository = open_command_repository(&materializer, repo, workspace).await?;
+    let bootstrap_materializer = FilesystemMaterializer::new();
+    let repository = open_command_repository(&bootstrap_materializer, repo, workspace).await?;
+    let materializer = command_materializer(&repository);
     let cursor = repository.cursor_info().await?;
     let graph = load_printable_timeline_graph(&repository, &materializer).await?;
 
@@ -569,6 +588,10 @@ async fn workspace(command: WorkspaceCommands, verbose: bool) -> Result<(), CliE
     }
 
     Ok(())
+}
+
+fn command_materializer(repository: &Repository) -> FilesystemMaterializer {
+    FilesystemMaterializer::with_cache_path(repository.capture_cache_path())
 }
 
 async fn open_command_repository(
