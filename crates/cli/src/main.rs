@@ -7,9 +7,10 @@ use era_materialization::{
     WorkingDirectory,
 };
 use era_repository::{
-    AutoSnapshotTrigger, BranchHead, BranchName, BranchOperationResult, Repository,
-    RepositoryError, RestoreResult, SnapshotRequest, SnapshotResult, SwitchResult, TimelineEntry,
-    TreeChange, TreeChangeKind, WorkingTreeStatus,
+    AddWorkspaceOptions, AutoSnapshotTrigger, BranchHead, BranchName, BranchOperationResult,
+    CursorInfo, Repository, RepositoryError, RestoreResult, SnapshotRequest, SnapshotResult,
+    SwitchResult, TimelineEntry, TreeChange, TreeChangeKind, WorkingTreeStatus, WorkspaceAddResult,
+    WorkspaceHead, WorkspaceId,
 };
 use std::{error::Error, fmt, path::PathBuf, pin::Pin, process::ExitCode, time::Duration};
 use tokio::time::{self, MissedTickBehavior, Sleep};
@@ -54,9 +55,22 @@ enum Commands {
         /// Optional author recorded on the snapshot.
         #[arg(long)]
         author: Option<String>,
+        /// Shared Era repository to lazily connect this directory to before snapping.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Workspace ID to use with --repo. Defaults to the current directory name.
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Show the current repository state.
-    Status,
+    Status {
+        /// Shared Era repository to lazily connect this directory to before checking status.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Workspace ID to use with --repo. Defaults to the current directory name.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// List branches or create a branch at the current state.
     Branch {
         /// Branch name to create. Omit to list branches.
@@ -71,9 +85,18 @@ enum Commands {
     Restore {
         /// Snapshot ID, unique ID prefix, or exact snapshot label.
         target: String,
+        /// Shared Era repository to lazily connect this directory to before restoring.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Workspace ID to use with --repo. Defaults to the current directory name.
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// Watch the working directory and create automatic snapshots after edits settle.
     Watch {
+        /// Shared Era repository to lazily connect this directory to before watching.
+        #[arg(long)]
+        repo: Option<PathBuf>,
         /// Run one reconciliation pass and exit.
         #[arg(long)]
         once: bool,
@@ -83,9 +106,9 @@ enum Commands {
         /// Periodic full reconciliation interval for missed watcher events.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         reconcile_secs: u64,
-        /// Workspace ID recorded in automatic snapshot provenance.
-        #[arg(long, default_value = "default")]
-        workspace: String,
+        /// Workspace ID used for lazy --repo connection and automatic snapshot provenance.
+        #[arg(long)]
+        workspace: Option<String>,
         /// Agent ID recorded in automatic snapshot provenance.
         #[arg(long)]
         agent: Option<String>,
@@ -96,8 +119,44 @@ enum Commands {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Show the current branch timeline, newest snapshot first.
-    Timeline,
+    /// Show the current cursor timeline, newest snapshot first.
+    Timeline {
+        /// Shared Era repository to lazily connect this directory to before showing the timeline.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Workspace ID to use with --repo. Defaults to the current directory name.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Manage connected workspaces.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommands {
+    /// Ensure a path is connected as a workspace of a shared repository.
+    Add {
+        /// Directory to create, populate, or adopt as a workspace.
+        path: PathBuf,
+        /// Shared Era repository. Defaults to the current repository or workspace.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Workspace ID. Defaults to the target directory name.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Base snapshot, branch, workspace, unique prefix, or exact label. Defaults to current state.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// List workspaces registered in the shared repository.
+    List {
+        /// Shared Era repository. Defaults to the current repository or workspace.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 async fn run(cli: Cli) -> Result<(), CliError> {
@@ -107,12 +166,19 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             label,
             message,
             author,
-        } => snap(label, message, author, cli.verbose).await,
-        Commands::Status => status(cli.verbose).await,
+            repo,
+            workspace,
+        } => snap(label, message, author, repo, workspace, cli.verbose).await,
+        Commands::Status { repo, workspace } => status(repo, workspace, cli.verbose).await,
         Commands::Branch { name } => branch(name, cli.verbose).await,
         Commands::Switch { name } => switch(name, cli.verbose).await,
-        Commands::Restore { target } => restore(target, cli.verbose).await,
+        Commands::Restore {
+            target,
+            repo,
+            workspace,
+        } => restore(target, repo, workspace, cli.verbose).await,
         Commands::Watch {
+            repo,
             once,
             debounce_ms,
             reconcile_secs,
@@ -123,6 +189,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         } => {
             watch(
                 WatchArgs {
+                    repo,
                     once,
                     debounce_ms,
                     reconcile_secs,
@@ -137,7 +204,8 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             )
             .await
         }
-        Commands::Timeline => timeline(cli.verbose).await,
+        Commands::Timeline { repo, workspace } => timeline(repo, workspace, cli.verbose).await,
+        Commands::Workspace { command } => workspace(command, cli.verbose).await,
     }
 }
 
@@ -160,11 +228,13 @@ async fn snap(
     label: Option<String>,
     message: Option<String>,
     author: Option<String>,
+    repo: Option<PathBuf>,
+    workspace: Option<String>,
     verbose: bool,
 ) -> Result<(), CliError> {
     let materializer = FilesystemMaterializer::new();
-    let repository = Repository::open(current_directory()?).await?;
-    let branch = repository.current_branch().await?;
+    let repository = open_command_repository(&materializer, repo, workspace).await?;
+    let cursor = repository.cursor_info().await?;
     let message = message.or(label);
     let has_label = message.is_some();
     let mut request = match message {
@@ -174,16 +244,19 @@ async fn snap(
     if let Some(author) = author {
         request = request.with_author(author);
     }
+    if let Some(workspace) = repository.workspace_id() {
+        request = request.with_provenance_attribute("workspace", workspace.as_str());
+    }
 
     if has_label {
         let result = repository.snapshot(&materializer, request).await?;
-        print_snapshot_result("Created snapshot", &result, &branch, verbose);
+        print_snapshot_result("Created snapshot", &result, &cursor, verbose);
         print_capture_warnings(&result);
     } else if let Some(result) = repository
         .snapshot_if_changed(&materializer, request)
         .await?
     {
-        print_snapshot_result("Created snapshot", &result, &branch, verbose);
+        print_snapshot_result("Created snapshot", &result, &cursor, verbose);
         print_capture_warnings(&result);
     } else {
         anstream::println!("No changes");
@@ -192,24 +265,28 @@ async fn snap(
     Ok(())
 }
 
-async fn status(verbose: bool) -> Result<(), CliError> {
+async fn status(
+    repo: Option<PathBuf>,
+    workspace: Option<String>,
+    verbose: bool,
+) -> Result<(), CliError> {
     let materializer = FilesystemMaterializer::new();
-    let repository = Repository::open(current_directory()?).await?;
-    let branch = repository.current_branch().await?;
+    let repository = open_command_repository(&materializer, repo, workspace).await?;
+    let cursor = repository.cursor_info().await?;
     let timeline = repository.timeline().await?;
     if timeline.is_empty() {
         return Err(CliError::EmptyTimeline);
     }
     let status = repository.working_tree_status(&materializer).await?;
-    let branch_ref = repository.current_branch_ref_path().await?;
+    let cursor_ref = repository.current_cursor_ref_path().await?;
 
     print_status(
         &repository,
-        &branch,
+        &cursor,
         &status,
         timeline.len(),
         verbose,
-        &branch_ref,
+        &cursor_ref,
     );
     print_scan_warnings(&status.comparison.issues);
     Ok(())
@@ -246,9 +323,14 @@ async fn switch(name: String, verbose: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn restore(target: String, verbose: bool) -> Result<(), CliError> {
+async fn restore(
+    target: String,
+    repo: Option<PathBuf>,
+    workspace: Option<String>,
+    verbose: bool,
+) -> Result<(), CliError> {
     let materializer = FilesystemMaterializer::new();
-    let repository = Repository::open(current_directory()?).await?;
+    let repository = open_command_repository(&materializer, repo, workspace).await?;
     let result = repository.restore(&materializer, &target).await?;
 
     print_restore_result(&result, verbose);
@@ -258,6 +340,7 @@ async fn restore(target: String, verbose: bool) -> Result<(), CliError> {
 
 #[derive(Debug)]
 struct WatchArgs {
+    repo: Option<PathBuf>,
     once: bool,
     debounce_ms: u64,
     reconcile_secs: u64,
@@ -266,7 +349,7 @@ struct WatchArgs {
 
 #[derive(Debug)]
 struct WatchMetadata {
-    workspace: String,
+    workspace: Option<String>,
     agent: Option<String>,
     task: Option<String>,
     model: Option<String>,
@@ -274,7 +357,8 @@ struct WatchMetadata {
 
 async fn watch(args: WatchArgs, verbose: bool) -> Result<(), CliError> {
     let materializer = FilesystemMaterializer::new();
-    let repository = Repository::open(current_directory()?).await?;
+    let repository =
+        open_command_repository(&materializer, args.repo, args.metadata.workspace.clone()).await?;
 
     if args.once {
         let saved = snapshot_if_changed_for_watch(
@@ -353,7 +437,10 @@ async fn snapshot_if_changed_for_watch(
     metadata: &WatchMetadata,
 ) -> Result<Option<SnapshotResult>, CliError> {
     repository
-        .snapshot_if_changed(materializer, auto_snapshot_request(trigger, metadata))
+        .snapshot_if_changed(
+            materializer,
+            auto_snapshot_request(trigger, metadata, repository),
+        )
         .await
         .map_err(CliError::from)
 }
@@ -361,9 +448,15 @@ async fn snapshot_if_changed_for_watch(
 fn auto_snapshot_request(
     trigger: AutoSnapshotTrigger,
     metadata: &WatchMetadata,
+    repository: &Repository,
 ) -> SnapshotRequest {
+    let workspace = metadata
+        .workspace
+        .clone()
+        .or_else(|| repository.workspace_id().map(|id| id.as_str().to_owned()))
+        .unwrap_or_else(|| era_repository::DEFAULT_WORKSPACE_ID.to_owned());
     let mut request = SnapshotRequest::automatic_for_trigger(trigger)
-        .with_provenance_attribute("workspace", metadata.workspace.clone());
+        .with_provenance_attribute("workspace", workspace);
 
     if let Some(agent) = &metadata.agent {
         request = request.with_provenance_attribute("agent", agent.clone());
@@ -382,13 +475,103 @@ fn invalidate_watch_event_paths(materializer: &FilesystemMaterializer, event: &W
     materializer.invalidate_paths(event.paths.iter());
 }
 
-async fn timeline(verbose: bool) -> Result<(), CliError> {
-    let repository = Repository::open(current_directory()?).await?;
-    let branch = repository.current_branch().await?;
+async fn timeline(
+    repo: Option<PathBuf>,
+    workspace: Option<String>,
+    verbose: bool,
+) -> Result<(), CliError> {
+    let materializer = FilesystemMaterializer::new();
+    let repository = open_command_repository(&materializer, repo, workspace).await?;
+    let cursor = repository.cursor_info().await?;
     let entries = repository.timeline().await?;
 
-    print_timeline(&branch, &entries, verbose);
+    print_timeline(&cursor, &entries, verbose);
     Ok(())
+}
+
+async fn workspace(command: WorkspaceCommands, verbose: bool) -> Result<(), CliError> {
+    match command {
+        WorkspaceCommands::Add {
+            path,
+            repo,
+            workspace,
+            from,
+        } => {
+            let materializer = FilesystemMaterializer::new();
+            let source = match repo {
+                Some(repo) => Repository::open_repository_path(repo).await?,
+                None => Repository::open(current_directory()?).await?,
+            };
+            let workspace_id = infer_workspace_id(&path, workspace)?;
+            let result = source
+                .add_workspace(
+                    &materializer,
+                    AddWorkspaceOptions {
+                        path,
+                        workspace_id,
+                        from,
+                    },
+                )
+                .await?;
+            print_workspace_add_result(&result, verbose);
+        }
+        WorkspaceCommands::List { repo } => {
+            let repository = match repo {
+                Some(repo) => Repository::open_repository_path(repo).await?,
+                None => Repository::open(current_directory()?).await?,
+            };
+            let workspaces = repository.workspaces().await?;
+            print_workspaces(&workspaces, verbose);
+        }
+    }
+
+    Ok(())
+}
+
+async fn open_command_repository(
+    materializer: &FilesystemMaterializer,
+    repo: Option<PathBuf>,
+    workspace: Option<String>,
+) -> Result<Repository, CliError> {
+    match repo {
+        Some(repo) => {
+            let current_dir = current_directory()?;
+            let workspace_id = infer_workspace_id(&current_dir, workspace)?;
+            Repository::open_or_add_workspace(repo, current_dir, workspace_id, materializer)
+                .await
+                .map_err(CliError::from)
+        }
+        None => Repository::open(current_directory()?)
+            .await
+            .map_err(CliError::from),
+    }
+}
+
+fn infer_workspace_id(
+    path: &std::path::Path,
+    workspace: Option<String>,
+) -> Result<WorkspaceId, CliError> {
+    if let Some(workspace) = workspace {
+        return WorkspaceId::new(workspace)
+            .map_err(RepositoryError::from)
+            .map_err(CliError::from);
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::current_dir().ok().and_then(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| era_repository::DEFAULT_WORKSPACE_ID.to_owned());
+    WorkspaceId::new(name)
+        .map_err(RepositoryError::from)
+        .map_err(CliError::from)
 }
 
 fn current_directory() -> Result<PathBuf, CliError> {
@@ -402,14 +585,15 @@ fn print_init_result(result: &era_repository::InitResult, branch: &BranchName, v
 
     if verbose {
         anstream::println!();
-        print_snapshot_details(&result.snapshot, branch);
+        let cursor = CursorInfo::Branch(branch.clone());
+        print_snapshot_details(&result.snapshot, &cursor);
     }
 }
 
 fn print_snapshot_result(
     heading: &str,
     result: &SnapshotResult,
-    branch: &BranchName,
+    cursor: &CursorInfo,
     verbose: bool,
 ) {
     print_success_heading(heading);
@@ -426,7 +610,7 @@ fn print_snapshot_result(
 
     if verbose {
         anstream::println!();
-        print_snapshot_details(result, branch);
+        print_snapshot_details(result, cursor);
     }
 }
 
@@ -440,11 +624,11 @@ fn print_field(label: &str, value: impl fmt::Display) {
     anstream::println!("  {label_style}{label:<10}{label_style:#} {value}");
 }
 
-fn print_snapshot_details(result: &SnapshotResult, branch: &BranchName) {
+fn print_snapshot_details(result: &SnapshotResult, cursor: &CursorInfo) {
     print_section("Details");
     print_detail("Full snapshot", result.snapshot_id);
     print_detail("Root tree", result.snapshot.root_tree_id());
-    print_detail("Branch", branch);
+    print_detail(cursor.kind(), cursor.name());
     print_detail(
         "Timestamp",
         format!("{} ms", result.snapshot.timestamp_millis()),
@@ -484,15 +668,15 @@ fn print_detail(label: &str, value: impl fmt::Display) {
 
 fn print_status(
     repository: &Repository,
-    branch: &BranchName,
+    cursor: &CursorInfo,
     status: &WorkingTreeStatus,
     timeline_len: usize,
     verbose: bool,
-    branch_ref: &std::path::Path,
+    cursor_ref: &std::path::Path,
 ) {
     print_success_heading("Repository status");
     let snapshot = &status.snapshot;
-    print_field("Branch", branch);
+    print_field(cursor.kind(), cursor.name());
     print_field(
         "Snapshot",
         styled(accent_style(), short_id(status.snapshot_id)),
@@ -518,7 +702,11 @@ fn print_status(
         print_detail("Metadata", repository.metadata_dir().display());
         print_detail("Objects", repository.object_store().root().display());
         print_detail("HEAD", repository.head_path().display());
-        print_detail("Branch ref", branch_ref.display());
+        let ref_label = match cursor {
+            CursorInfo::Branch(_) => "Branch ref",
+            CursorInfo::Workspace(_) => "Cursor ref",
+        };
+        print_detail(ref_label, cursor_ref.display());
         print_detail("Full snapshot", status.snapshot_id);
         print_detail("Root tree", snapshot.root_tree_id());
         print_detail("Current tree", status.current_root_tree_id);
@@ -602,6 +790,58 @@ fn print_branches(branches: &[BranchHead], verbose: bool) {
 
         if verbose {
             print_indented_detail("Full snapshot", branch.snapshot_id);
+        }
+    }
+}
+
+fn print_workspace_add_result(result: &WorkspaceAddResult, verbose: bool) {
+    let heading = if result.created {
+        "Added workspace"
+    } else {
+        "Workspace already connected"
+    };
+    print_success_heading(heading);
+    print_field("Workspace", &result.workspace_id);
+    print_field("Path", result.path.display());
+    print_field(
+        "Snapshot",
+        styled(accent_style(), short_id(result.snapshot_id)),
+    );
+    print_field(
+        "Files",
+        if result.materialized {
+            "materialized"
+        } else {
+            "adopted"
+        },
+    );
+
+    if verbose && let Some(materialization) = &result.materialization {
+        print_materialize_details(materialization);
+    }
+}
+
+fn print_workspaces(workspaces: &[WorkspaceHead], verbose: bool) {
+    anstream::println!("Workspaces");
+    for workspace in workspaces {
+        let marker = if workspace.is_current { "*" } else { " " };
+        let name = if workspace.is_current {
+            styled(accent_style(), &workspace.id)
+        } else {
+            workspace.id.to_string()
+        };
+        let path = workspace
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        anstream::println!(
+            "{marker} {name} {} {path}",
+            styled(accent_style(), short_id(workspace.snapshot_id))
+        );
+
+        if verbose {
+            print_indented_detail("Full snapshot", workspace.snapshot_id);
         }
     }
 }
@@ -716,8 +956,18 @@ fn print_watch_snapshot_result(
     }
 }
 
-fn print_timeline(branch: &BranchName, entries: &[TimelineEntry], verbose: bool) {
-    anstream::println!("Timeline for {}", styled(accent_style(), branch));
+fn print_timeline(cursor: &CursorInfo, entries: &[TimelineEntry], verbose: bool) {
+    match cursor {
+        CursorInfo::Branch(branch) => {
+            anstream::println!("Timeline for {}", styled(accent_style(), branch));
+        }
+        CursorInfo::Workspace(workspace) => {
+            anstream::println!(
+                "Timeline for workspace {}",
+                styled(accent_style(), workspace)
+            );
+        }
+    }
 
     for entry in entries {
         print_timeline_entry(entry.snapshot_id, &entry.snapshot, verbose);

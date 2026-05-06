@@ -9,7 +9,7 @@ publish.workspace = true
 era-core = { path = "../core" }
 era-materialization = { path = "../materialization" }
 era-object-store = { path = "../object-store" }
-tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "rt-multi-thread", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]

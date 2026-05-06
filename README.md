@@ -24,9 +24,11 @@ The goal is a system where humans and agents can save aggressively, experiment f
 
 ## Common workflows
 
-Save the current files if anything changed:
+Initialize a project and save the current files when anything changed:
 
 ```sh
+cd my-project
+era init
 era snap
 ```
 
@@ -39,10 +41,11 @@ era snap "known good"
 era timeline
 ```
 
-Go back to a previous state by label, full snapshot ID, or unique ID prefix:
+Go back to a previous state by label, branch/workspace name, full snapshot ID, or unique ID prefix:
 
 ```sh
 era restore "known good"
+era restore main
 era restore abc123
 ```
 
@@ -52,20 +55,52 @@ Keep dense local history while editing:
 era watch
 ```
 
-Record agent provenance while watching:
+Create an external workspace that shares the same `.era/objects` tree:
 
 ```sh
-era watch --workspace agent-1 --agent claude --task fix-parser --model sonnet
+cd my-project
+era workspace add ../runs/agent-1
+cd ../runs/agent-1
+era status
 ```
 
-Use the current v0 named-ref workflow for experiments:
+`workspace add` creates the target directory if it is missing, connects it to the source repo, writes a small `.era` pointer file, and materializes the current saved state. Workspaces should live outside the source workspace; nested workspaces are rejected by default.
+
+Start an agent in that workspace and record provenance while it works:
+
+```sh
+cd ../runs/agent-1
+era watch --agent claude --task fix-parser --model sonnet
+```
+
+Adopt an existing non-empty directory as a workspace without overwriting its files:
+
+```sh
+cd ../scratch-agent
+era snap --repo ../my-project --workspace scratch-agent
+```
+
+This lazily connects the current directory to `../my-project`, treats the existing files as dirty relative to the repo's current saved state, and creates a snapshot on the workspace cursor.
+
+Create several independent workspaces from a known base:
+
+```sh
+cd my-project
+era workspace add ../runs/parser-1 --from main
+era workspace add ../runs/parser-2 --from main
+era workspace list
+```
+
+Each workspace has its own cursor under `.era/refs/workspaces/<id>`, while blobs, trees, and snapshots are shared through the same object store.
+
+Use the current v0 named-ref workflow for experiments in the repository root:
 
 ```sh
 era branch experiment
 era switch experiment
 ```
 
-`branch` and `switch` expose the current implementation. The intended direction is state/workspace vocabulary: move a workspace to a state, edit files, and let the next snapshot create the new future.
+`branch` and `switch` expose the repository-root branch-ref implementation. Connected workspaces use workspace refs, so agents can diverge without contending on global `HEAD`.
 
 ## Direction
 
@@ -86,12 +121,14 @@ The implemented foundation covers:
 - Async local blob/tree/snapshot object storage.
 - Working-directory capture, scan, comparison, and restore.
 - Path-aware status with added, modified, deleted, and type-changed paths.
-- Local branch refs, branch switching, and snapshot restore.
+- Local branch refs, workspace refs, branch/workspace switching, and snapshot restore.
+- `era workspace add` / `era workspace list` for many materialized workspaces sharing one `.era/objects` tree.
+- Scoped metadata locks and atomic ref updates so concurrent agents can snapshot different workspaces safely.
 - Changed-only unlabeled snapshots plus optional labels for important states.
 - Foreground `era watch` auto-snapshots with debounce, periodic reconciliation, and structured provenance.
 - A per-materializer in-memory hash cache for long-running watch sessions.
 
-Notable future work includes persistent workspace hash caches, multi-workspace supervision, richer diff/merge flows, tracking heuristics, provenance indexing/querying, and git interoperability.
+Notable future work includes persistent workspace hash caches, workspace fleet supervision, richer diff/merge flows, tracking heuristics, provenance indexing/querying, and git interoperability.
 
 ## Prerequisites
 
@@ -119,7 +156,9 @@ cargo install --path crates/cli
 
 ## CLI usage
 
-Run commands from the working-directory root. Parent-directory repository discovery is future work.
+Run commands from the repository root or a connected workspace root. Parent-directory repository discovery is future work.
+
+Core repository commands:
 
 ```sh
 era init
@@ -127,21 +166,46 @@ era snap
 era snap "manual checkpoint"
 era snap --message "manual checkpoint"
 era status
-era branch
-era branch experiment
-era switch experiment
 era restore "manual checkpoint"
 era watch
 era watch --once
-era watch --workspace agent-1 --agent claude --task fix-parser --model sonnet
 era timeline
+```
+
+Workspace commands:
+
+```sh
+era workspace add ../runs/agent-1
+era workspace add ../runs/agent-2 --from main
+era workspace add . --repo ../project --workspace agent-1
+era workspace list
+```
+
+Branch-ref commands:
+
+```sh
+era branch
+era branch experiment
+era switch experiment
+```
+
+Lazy workspace connection works on commands that need workspace context:
+
+```sh
+era snap --repo ../project --workspace agent-1
+era status --repo ../project --workspace agent-1
+era restore main --repo ../project --workspace agent-1
+era watch --repo ../project --workspace agent-1 --agent claude --task fix-parser --model sonnet
+era timeline --repo ../project --workspace agent-1
 ```
 
 `era snap` is a rapid-fire "snapshot if files changed" command. Without a label it creates an unlabeled snapshot only when the working tree differs from the current saved state. `era snap "label"` and `era snap --message "label"` attach a human-facing label to the current state.
 
 `era status` reports whether the working tree matches the current saved snapshot and lists added, modified, deleted, and type-changed paths when it does not.
 
-`era branch` lists or creates branch refs, and `era switch` saves current work before switching refs. These commands expose the current v0 cursor implementation; the architecture is moving toward state/workspace vocabulary. `era restore` saves current work before restoring a snapshot ID, unique ID prefix, or exact snapshot label.
+`era workspace add PATH` is the single command for creating a missing workspace directory, connecting an empty directory, or adopting a non-empty directory as dirty relative to the inferred base snapshot. By default it infers the repository from the current repository/workspace, infers the workspace ID from the target directory name, uses the current saved state as the base, and rejects nested workspaces inside another workspace. Use `--from TARGET` to start from a specific branch, workspace, label, ID, or unique ID prefix.
+
+`era branch` lists or creates branch refs, and `era switch` saves current work before switching refs. These commands expose the current v0 repository-root cursor implementation; connected workspaces use workspace refs. `era restore` saves current work before restoring a snapshot ID, unique ID prefix, branch/workspace name, or exact snapshot label.
 
 `era watch` runs in the foreground, treats filesystem events as hints, debounces edits, periodically reconciles the full tree, and creates unlabeled automatic snapshots only when the tree changed. Watch snapshots record structured provenance such as trigger, workspace, agent, task, and model; timeline output renders their timestamp as a synthetic title instead of storing a label.
 

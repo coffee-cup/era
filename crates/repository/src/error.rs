@@ -1,4 +1,4 @@
-use crate::{BranchName, InvalidBranchName};
+use crate::{BranchName, InvalidBranchName, InvalidWorkspaceId, WorkspaceId};
 use era_core::ObjectId;
 use era_materialization::MaterializationError;
 use era_object_store::ObjectStoreError;
@@ -27,12 +27,35 @@ pub enum RepositoryError {
     InvalidRef { path: PathBuf, contents: String },
     /// A branch name could not be represented safely in the ref layout.
     InvalidBranchName { source: InvalidBranchName },
+    /// A workspace ID could not be represented safely in the metadata layout.
+    InvalidWorkspaceId { source: InvalidWorkspaceId },
     /// A branch ref file name could not be represented as UTF-8.
     InvalidBranchRefName { path: PathBuf },
     /// A branch already exists.
     BranchAlreadyExists { name: BranchName },
     /// A branch does not exist.
     BranchNotFound { name: BranchName },
+    /// A workspace ID already belongs to another path.
+    WorkspaceAlreadyExists {
+        id: WorkspaceId,
+        existing_path: PathBuf,
+        requested_path: PathBuf,
+    },
+    /// A workspace does not exist.
+    WorkspaceNotFound { id: WorkspaceId },
+    /// A workspace path could not be represented safely in the metadata layout.
+    InvalidWorkspaceRefName { path: PathBuf },
+    /// A workspace pointer file is invalid.
+    InvalidWorkspacePointer { path: PathBuf, contents: String },
+    /// A workspace path is nested inside another workspace.
+    WorkspaceInsideWorkspace {
+        path: PathBuf,
+        workspace_root: PathBuf,
+    },
+    /// A path is already an Era repository metadata directory or repository root.
+    WorkspacePathIsRepository { path: PathBuf },
+    /// A metadata lock could not be acquired before the timeout.
+    LockTimeout { path: PathBuf },
     /// A snapshot target could not be resolved.
     SnapshotTargetNotFound { target: String },
     /// A snapshot target matched more than one snapshot.
@@ -101,6 +124,7 @@ impl fmt::Display for RepositoryError {
                 contents
             ),
             Self::InvalidBranchName { source } => write!(formatter, "{source}"),
+            Self::InvalidWorkspaceId { source } => write!(formatter, "{source}"),
             Self::InvalidBranchRefName { path } => write!(
                 formatter,
                 "branch ref name is not UTF-8: {}",
@@ -110,6 +134,49 @@ impl fmt::Display for RepositoryError {
                 write!(formatter, "branch already exists: {name}")
             }
             Self::BranchNotFound { name } => write!(formatter, "branch not found: {name}"),
+            Self::WorkspaceAlreadyExists {
+                id,
+                existing_path,
+                requested_path,
+            } => write!(
+                formatter,
+                "workspace {id} is already registered at {}; requested {}",
+                existing_path.display(),
+                requested_path.display()
+            ),
+            Self::WorkspaceNotFound { id } => write!(formatter, "workspace not found: {id}"),
+            Self::InvalidWorkspaceRefName { path } => write!(
+                formatter,
+                "workspace ref name is not UTF-8: {}",
+                path.display()
+            ),
+            Self::InvalidWorkspacePointer { path, contents } => write!(
+                formatter,
+                "workspace pointer at {} is invalid: {:?}",
+                path.display(),
+                contents
+            ),
+            Self::WorkspaceInsideWorkspace {
+                path,
+                workspace_root,
+            } => write!(
+                formatter,
+                "refusing to create a workspace inside another workspace: {} is inside {}",
+                path.display(),
+                workspace_root.display()
+            ),
+            Self::WorkspacePathIsRepository { path } => write!(
+                formatter,
+                "workspace path is already an Era repository: {}",
+                path.display()
+            ),
+            Self::LockTimeout { path } => {
+                write!(
+                    formatter,
+                    "timed out waiting for repository lock: {}",
+                    path.display()
+                )
+            }
             Self::SnapshotTargetNotFound { target } => {
                 write!(formatter, "snapshot target not found: {target}")
             }
@@ -147,6 +214,7 @@ impl Error for RepositoryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidBranchName { source } => Some(source),
+            Self::InvalidWorkspaceId { source } => Some(source),
             Self::ClockBeforeUnixEpoch { source } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::ObjectStore { source } => Some(source),
@@ -163,6 +231,13 @@ impl Error for RepositoryError {
             | Self::InvalidBranchRefName { .. }
             | Self::BranchAlreadyExists { .. }
             | Self::BranchNotFound { .. }
+            | Self::WorkspaceAlreadyExists { .. }
+            | Self::WorkspaceNotFound { .. }
+            | Self::InvalidWorkspaceRefName { .. }
+            | Self::InvalidWorkspacePointer { .. }
+            | Self::WorkspaceInsideWorkspace { .. }
+            | Self::WorkspacePathIsRepository { .. }
+            | Self::LockTimeout { .. }
             | Self::SnapshotTargetNotFound { .. }
             | Self::SnapshotTargetAmbiguous { .. }
             | Self::SnapshotCycle { .. }
@@ -186,6 +261,12 @@ impl From<MaterializationError> for RepositoryError {
 impl From<InvalidBranchName> for RepositoryError {
     fn from(source: InvalidBranchName) -> Self {
         Self::InvalidBranchName { source }
+    }
+}
+
+impl From<InvalidWorkspaceId> for RepositoryError {
+    fn from(source: InvalidWorkspaceId) -> Self {
+        Self::InvalidWorkspaceId { source }
     }
 }
 

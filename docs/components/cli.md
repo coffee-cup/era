@@ -19,6 +19,7 @@ The CLI should stay thin. Durable behavior belongs in the repository, materializ
 │  - restore                                   │
 │  - watch                                     │
 │  - timeline                                  │
+│  - workspace add/list                        │
 ├──────────────────────────────────────────────┤
 │ Output rendering                             │
 │  - concise default output                    │
@@ -26,14 +27,14 @@ The CLI should stay thin. Durable behavior belongs in the repository, materializ
 │  - adaptive color                            │
 ├──────────────────────────────────────────────┤
 │ Runtime wiring                               │
-│  - current-directory repository access       │
+│  - current-directory repository/workspace access │
 │  - filesystem materializer construction      │
 │  - tracing setup                             │
 │  - foreground watch loop                     │
 └──────────────────────────────────────────────┘
 ```
 
-The current command surface still includes `branch` and `switch` because v0 persists named lines as branch refs. That vocabulary is not sacred: future CLI work can introduce state/workspace-oriented commands such as `go`, `mark`, `resume`, or workspace management while keeping the repository APIs underneath.
+The current command surface still includes `branch` and `switch` because repository-root named lines are branch refs. That vocabulary is not sacred: future CLI work can introduce state-oriented commands such as `go`, `mark`, or `resume` while keeping the repository APIs underneath. External agent workspaces use `workspace add` and per-workspace refs instead of global `HEAD`.
 
 ## Command flow
 
@@ -44,7 +45,7 @@ user command
 parse arguments and global flags
    │
    ▼
-open or initialize repository in current directory
+open or initialize repository/workspace in current directory
    │
    ▼
 construct filesystem materializer
@@ -72,7 +73,23 @@ capture current tree
 print snapshot result
 ```
 
-`era snap` without a label is intentionally rapid-fire and changed-only. Agents can call it after each tool action without worrying about duplicate snapshots. `era snap "label"` and `era snap --message "..."` are convenience forms for making a state easy to find by name.
+`era snap` without a label is intentionally rapid-fire and changed-only. Agents can call it after each tool action without worrying about duplicate snapshots. `era snap "label"` and `era snap --message "..."` are convenience forms for making a state easy to find by name. `snap`, `status`, `restore`, `watch`, and `timeline` accept `--repo REPO --workspace ID` to lazily connect the current directory to a shared repository before running; when `--workspace` is omitted in that mode, the directory basename is used.
+
+## Workspace add flow
+
+```text
+era workspace add PATH [--repo REPO] [--workspace ID] [--from TARGET]
+   │
+   ▼
+infer omitted repo, workspace ID, and base target
+   │
+   ├─ missing path ───────► create and materialize base snapshot
+   ├─ empty path ─────────► connect and materialize base snapshot
+   ├─ non-empty path ─────► connect/adopt without overwriting files
+   └─ nested path ────────► reject by default
+```
+
+`workspace add` is intentionally idempotent for the same workspace/path pair. It is the single public command for both creating a new workspace directory and adopting an existing directory.
 
 ## Watch flow
 
@@ -102,6 +119,7 @@ Watch snapshots carry structured provenance such as trigger, workspace, agent, t
 - Keep command output clear, concise, and script-friendly.
 - Expose verbose diagnostics without making normal output noisy.
 - Wire repository operations to a filesystem materializer for local workflows.
+- Connect or lazily adopt external workspace directories through repository APIs.
 - Run the foreground watch/debounce/reconcile loop.
 - Configure tracing so diagnostics go to stderr and remain disabled unless explicitly requested.
 
@@ -143,11 +161,11 @@ The library APIs remain the primary integration surface.
 
 ## v0 constraints
 
-- Commands operate from the working-directory root.
+- Commands operate from a repository root or connected workspace root; parent-directory discovery remains future work.
 - The watch loop runs in the foreground.
 - One-shot commands construct fresh materializer instances, so hash-cache reuse primarily benefits long-running watch sessions.
-- Branch/switch commands expose the current branch-ref implementation.
-- Parent-directory discovery, background daemons, and multi-workspace supervision are future work.
+- Branch/switch commands expose the repository-root branch-ref implementation.
+- `workspace add` and `workspace list` exist, but background daemons and fleet supervision are future work.
 
 ## Future seams
 

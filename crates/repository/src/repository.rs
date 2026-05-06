@@ -1,11 +1,16 @@
 use crate::{
-    BranchName, RepositoryError,
+    BranchName, RepositoryError, WorkspaceId,
     error::io_error,
     refs::{
-        branch_ref_exists, branch_ref_path, create_branch_ref, create_ref_layout, head_path,
-        list_branch_refs, metadata_dir, objects_dir, read_branch_ref, read_head_branch,
-        write_branch_ref, write_head,
+        acquire_metadata_lock, branch_lock_path, branch_ref_exists, branch_ref_path,
+        create_branch_ref, create_ref_layout, create_workspace_ref, head_path, list_branch_refs,
+        list_workspace_paths, list_workspace_refs, metadata_dir, objects_dir, read_branch_ref,
+        read_head_branch, read_workspace_path, read_workspace_pointer, read_workspace_ref,
+        workspace_pointer_path, workspace_record_exists, workspace_record_lock_path,
+        workspace_ref_exists, workspace_ref_lock_path, workspace_ref_path, write_branch_ref,
+        write_head, write_workspace_path, write_workspace_pointer, write_workspace_ref,
     },
+    workspace::{DEFAULT_WORKSPACE_ID, WorkspacePointer},
 };
 use era_core::{ObjectId, ObjectKind, Snapshot, SnapshotProvenance};
 use era_materialization::{
@@ -14,7 +19,7 @@ use era_materialization::{
 };
 use era_object_store::LocalObjectStore;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -22,15 +27,25 @@ use std::{
 use tokio::fs;
 use tracing::{debug, trace};
 
-/// Workspace ID used until repositories support multiple registered workspaces.
-pub const DEFAULT_WORKSPACE_ID: &str = "default";
-
-/// A local Era repository rooted at a working directory.
+/// A local Era repository opened in the context of one materialized workspace.
 #[derive(Debug, Clone)]
 pub struct Repository {
     root: PathBuf,
     metadata_dir: PathBuf,
     object_store: LocalObjectStore,
+    cursor: RepositoryCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RepositoryCursor {
+    CurrentBranch,
+    Workspace(WorkspaceId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CursorReference {
+    Branch(BranchName),
+    Workspace(WorkspaceId),
 }
 
 impl Repository {
@@ -58,6 +73,7 @@ impl Repository {
             root,
             metadata_dir,
             object_store,
+            cursor: RepositoryCursor::CurrentBranch,
         };
 
         let branch = BranchName::main();
@@ -74,13 +90,88 @@ impl Repository {
         })
     }
 
-    /// Opens an existing repository at `root`.
+    /// Opens an existing repository or connected external workspace at `root`.
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self, RepositoryError> {
         let root = root.into();
-        debug!(root = %root.display(), "opening repository");
+        debug!(root = %root.display(), "opening repository workspace");
         ensure_working_root(&root).await?;
 
-        let metadata_dir = metadata_dir(&root);
+        let era_marker = metadata_dir(&root);
+        let metadata =
+            fs::symlink_metadata(&era_marker)
+                .await
+                .map_err(|source| match source.kind() {
+                    io::ErrorKind::NotFound => RepositoryError::NotRepository {
+                        path: era_marker.clone(),
+                    },
+                    _ => io_error(era_marker.clone(), source),
+                })?;
+
+        if metadata.file_type().is_dir() {
+            return Self::open_metadata_dir(root, era_marker, RepositoryCursor::CurrentBranch)
+                .await;
+        }
+
+        if metadata.file_type().is_file() {
+            let pointer = read_workspace_pointer(&root).await?;
+            ensure_metadata_dir(&pointer.metadata_dir).await?;
+            read_head_branch(&pointer.metadata_dir).await?;
+            if !workspace_ref_exists(&pointer.metadata_dir, &pointer.workspace_id).await? {
+                return Err(RepositoryError::WorkspaceNotFound {
+                    id: pointer.workspace_id,
+                });
+            }
+            return Self::open_metadata_dir(
+                root,
+                pointer.metadata_dir,
+                RepositoryCursor::Workspace(pointer.workspace_id),
+            )
+            .await;
+        }
+
+        Err(RepositoryError::NotRepository { path: era_marker })
+    }
+
+    /// Opens a repository argument that may point at a repo root, `.era`, `.era/objects`, or workspace.
+    pub async fn open_repository_path(path: impl Into<PathBuf>) -> Result<Self, RepositoryError> {
+        let path = path.into();
+        if let Some(metadata) = metadata_argument(&path).await? {
+            let root = metadata
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| path.clone());
+            return Self::open_metadata_dir(root, metadata, RepositoryCursor::CurrentBranch).await;
+        }
+
+        Self::open(path).await
+    }
+
+    /// Ensures `workspace_path` is connected to `repo_path`, then opens it as a workspace.
+    pub async fn open_or_add_workspace(
+        repo_path: impl Into<PathBuf>,
+        workspace_path: impl Into<PathBuf>,
+        workspace_id: WorkspaceId,
+        materializer: &dyn Materializer,
+    ) -> Result<Self, RepositoryError> {
+        let repo = Self::open_repository_path(repo_path).await?;
+        let path = workspace_path.into();
+        repo.add_workspace(
+            materializer,
+            AddWorkspaceOptions {
+                path: path.clone(),
+                workspace_id,
+                from: None,
+            },
+        )
+        .await?;
+        Self::open(path).await
+    }
+
+    async fn open_metadata_dir(
+        root: PathBuf,
+        metadata_dir: PathBuf,
+        cursor: RepositoryCursor,
+    ) -> Result<Self, RepositoryError> {
         ensure_metadata_dir(&metadata_dir).await?;
         read_head_branch(&metadata_dir).await?;
         let object_store = LocalObjectStore::open(objects_dir(&metadata_dir)).await?;
@@ -89,16 +180,17 @@ impl Repository {
             root,
             metadata_dir,
             object_store,
+            cursor,
         })
     }
 
-    /// Returns the working-directory root path.
+    /// Returns the materialized workspace root path for this repository handle.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Returns the `.era` metadata directory path.
+    /// Returns the `.era` metadata directory path for the shared repository.
     #[must_use]
     pub fn metadata_dir(&self) -> &Path {
         &self.metadata_dir
@@ -110,48 +202,66 @@ impl Repository {
         &self.object_store
     }
 
-    /// Captures a manual snapshot and advances the current branch reference.
+    /// Returns information about the mutable cursor this handle operates on.
+    pub async fn cursor_info(&self) -> Result<CursorInfo, RepositoryError> {
+        match self.current_cursor_reference().await? {
+            CursorReference::Branch(branch) => Ok(CursorInfo::Branch(branch)),
+            CursorReference::Workspace(workspace) => Ok(CursorInfo::Workspace(workspace)),
+        }
+    }
+
+    /// Returns the connected workspace ID, if this handle is opened from an external workspace.
+    #[must_use]
+    pub fn workspace_id(&self) -> Option<&WorkspaceId> {
+        match &self.cursor {
+            RepositoryCursor::CurrentBranch => None,
+            RepositoryCursor::Workspace(workspace) => Some(workspace),
+        }
+    }
+
+    /// Captures a manual snapshot and advances the current cursor.
     pub async fn snapshot(
         &self,
         materializer: &dyn Materializer,
         request: SnapshotRequest,
     ) -> Result<SnapshotResult, RepositoryError> {
-        let branch = self.current_branch().await?;
-        let parent = read_branch_ref(&self.metadata_dir, &branch).await?;
-        debug!(branch = branch.as_str(), parent = %parent, "creating manual snapshot");
+        let capture = self.capture_working_tree(materializer).await?;
+        let cursor = self.current_cursor_reference().await?;
+        let _lock = self.acquire_cursor_lock(&cursor).await?;
+        let parent = self.read_cursor_ref(&cursor).await?;
+        debug!(cursor = cursor.as_log_value(), parent = %parent, "creating manual snapshot");
 
-        let snapshot = self
-            .capture_snapshot(materializer, request, vec![parent])
-            .await?;
-        write_branch_ref(&self.metadata_dir, &branch, snapshot.snapshot_id).await?;
+        let snapshot = self.store_snapshot(capture, request, vec![parent]).await?;
+        self.write_cursor_ref(&cursor, snapshot.snapshot_id).await?;
 
-        debug!(branch = branch.as_str(), %snapshot.snapshot_id, "advanced branch ref");
+        debug!(cursor = cursor.as_log_value(), %snapshot.snapshot_id, "advanced cursor ref");
         Ok(snapshot)
     }
 
-    /// Captures and advances the current branch only when the working tree changed.
+    /// Captures and advances the current cursor only when the working tree changed.
     pub async fn snapshot_if_changed(
         &self,
         materializer: &dyn Materializer,
         request: SnapshotRequest,
     ) -> Result<Option<SnapshotResult>, RepositoryError> {
-        let branch = self.current_branch().await?;
-        let parent = read_branch_ref(&self.metadata_dir, &branch).await?;
-        let parent_snapshot = self.object_store.get_snapshot(&parent).await?;
         let capture = self.capture_working_tree(materializer).await?;
+        let cursor = self.current_cursor_reference().await?;
+        let _lock = self.acquire_cursor_lock(&cursor).await?;
+        let parent = self.read_cursor_ref(&cursor).await?;
+        let parent_snapshot = self.object_store.get_snapshot(&parent).await?;
         if capture.root_tree_id == parent_snapshot.root_tree_id() {
-            debug!(branch = branch.as_str(), parent = %parent, "working tree unchanged; skipping snapshot");
+            debug!(cursor = cursor.as_log_value(), parent = %parent, "working tree unchanged; skipping snapshot");
             return Ok(None);
         }
 
         let snapshot = self.store_snapshot(capture, request, vec![parent]).await?;
-        write_branch_ref(&self.metadata_dir, &branch, snapshot.snapshot_id).await?;
+        self.write_cursor_ref(&cursor, snapshot.snapshot_id).await?;
 
-        debug!(branch = branch.as_str(), %snapshot.snapshot_id, "advanced branch ref after change capture");
+        debug!(cursor = cursor.as_log_value(), %snapshot.snapshot_id, "advanced cursor ref after change capture");
         Ok(Some(snapshot))
     }
 
-    /// Returns whether the working directory matches the current branch snapshot.
+    /// Returns whether the working directory matches the current cursor snapshot.
     pub async fn working_tree_status(
         &self,
         materializer: &dyn Materializer,
@@ -197,6 +307,149 @@ impl Repository {
         Ok(branches)
     }
 
+    /// Lists registered workspaces sorted by ID.
+    pub async fn workspaces(&self) -> Result<Vec<WorkspaceHead>, RepositoryError> {
+        let paths: HashMap<WorkspaceId, Option<PathBuf>> = list_workspace_paths(&self.metadata_dir)
+            .await?
+            .into_iter()
+            .collect();
+        let current_workspace = self.workspace_id().cloned();
+        let mut workspaces = Vec::new();
+
+        for (id, snapshot_id) in list_workspace_refs(&self.metadata_dir).await? {
+            let path = paths.get(&id).cloned().flatten();
+            let is_current = current_workspace.as_ref() == Some(&id);
+            workspaces.push(WorkspaceHead {
+                id,
+                snapshot_id,
+                path,
+                is_current,
+            });
+        }
+
+        Ok(workspaces)
+    }
+
+    /// Creates or adopts a workspace connected to this repository's object store and refs.
+    pub async fn add_workspace(
+        &self,
+        materializer: &dyn Materializer,
+        options: AddWorkspaceOptions,
+    ) -> Result<WorkspaceAddResult, RepositoryError> {
+        let requested_path = options.path;
+        let workspace_id = options.workspace_id;
+        let target_path = absolute_path_for_create(&requested_path).await?;
+        let source_root = absolute_existing_path(&self.root).await?;
+
+        if target_path == source_root || workspace_pointer_path(&target_path).is_dir() {
+            return Err(RepositoryError::WorkspacePathIsRepository { path: target_path });
+        }
+        if target_path.starts_with(&source_root) {
+            return Err(RepositoryError::WorkspaceInsideWorkspace {
+                path: target_path,
+                workspace_root: source_root,
+            });
+        }
+        for (existing_id, existing_path) in list_workspace_paths(&self.metadata_dir).await? {
+            let Some(existing_path) = existing_path else {
+                continue;
+            };
+            let existing_root = if path_exists(&existing_path).await? {
+                absolute_existing_path(&existing_path).await?
+            } else {
+                existing_path
+            };
+            if target_path == existing_root && existing_id != workspace_id {
+                return Err(RepositoryError::WorkspaceAlreadyExists {
+                    id: existing_id,
+                    existing_path: existing_root,
+                    requested_path: target_path,
+                });
+            }
+            if target_path != existing_root && target_path.starts_with(&existing_root) {
+                return Err(RepositoryError::WorkspaceInsideWorkspace {
+                    path: target_path,
+                    workspace_root: existing_root,
+                });
+            }
+        }
+
+        let existed = path_exists(&target_path).await?;
+        if existed {
+            ensure_working_root(&target_path).await?;
+        } else {
+            fs::create_dir_all(&target_path)
+                .await
+                .map_err(|source| io_error(target_path.clone(), source))?;
+        }
+        let was_empty = directory_is_empty(&target_path).await?;
+
+        let base = match options.from {
+            Some(target) => self.resolve_snapshot_target(&target).await?.snapshot_id,
+            None => {
+                self.save_current_state_if_changed(materializer).await?;
+                self.current_snapshot_id().await?
+            }
+        };
+
+        let lock_path = workspace_record_lock_path(&self.metadata_dir, &workspace_id);
+        let _lock = acquire_metadata_lock(lock_path).await?;
+
+        let already_registered = workspace_record_exists(&self.metadata_dir, &workspace_id).await?;
+        let ref_exists = workspace_ref_exists(&self.metadata_dir, &workspace_id).await?;
+        if already_registered {
+            let existing_path = read_workspace_path(&self.metadata_dir, &workspace_id).await?;
+            if existing_path != target_path {
+                return Err(RepositoryError::WorkspaceAlreadyExists {
+                    id: workspace_id,
+                    existing_path,
+                    requested_path: target_path,
+                });
+            }
+        }
+
+        if !ref_exists {
+            create_workspace_ref(&self.metadata_dir, &workspace_id, base).await?;
+        }
+        if !already_registered {
+            write_workspace_path(&self.metadata_dir, &workspace_id, &target_path).await?;
+        }
+
+        let pointer = WorkspacePointer::new(
+            absolute_path_preserving_symlinks(&self.metadata_dir)?,
+            workspace_id.clone(),
+        );
+        write_workspace_pointer(&target_path, &pointer).await?;
+
+        let materialized = (!existed || was_empty) && !already_registered;
+        let materialization = if materialized {
+            let snapshot_id = read_workspace_ref(&self.metadata_dir, &workspace_id).await?;
+            let snapshot = self.object_store.get_snapshot(&snapshot_id).await?;
+            let working_directory = WorkingDirectory::new(&target_path);
+            Some(
+                materializer
+                    .materialize_tree(
+                        snapshot.root_tree_id(),
+                        &working_directory,
+                        &self.object_store,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let snapshot_id = read_workspace_ref(&self.metadata_dir, &workspace_id).await?;
+        Ok(WorkspaceAddResult {
+            workspace_id,
+            path: target_path,
+            snapshot_id,
+            created: !already_registered,
+            materialized,
+            materialization,
+        })
+    }
+
     /// Creates a branch at the current saved state, saving unsnapped work first.
     pub async fn create_branch(
         &self,
@@ -219,7 +472,7 @@ impl Repository {
         })
     }
 
-    /// Switches HEAD to an existing branch, saving unsnapped work first.
+    /// Switches this repository handle to an existing branch, saving unsnapped work first.
     pub async fn switch_branch(
         &self,
         materializer: &dyn Materializer,
@@ -240,7 +493,15 @@ impl Repository {
                 &self.object_store,
             )
             .await?;
-        write_head(&self.metadata_dir, &name).await?;
+
+        match &self.cursor {
+            RepositoryCursor::CurrentBranch => write_head(&self.metadata_dir, &name).await?,
+            RepositoryCursor::Workspace(workspace) => {
+                let cursor = CursorReference::Workspace(workspace.clone());
+                let _lock = self.acquire_cursor_lock(&cursor).await?;
+                self.write_cursor_ref(&cursor, snapshot_id).await?;
+            }
+        }
 
         debug!(branch = name.as_str(), %snapshot_id, "switched branch");
         Ok(SwitchResult {
@@ -252,7 +513,7 @@ impl Repository {
         })
     }
 
-    /// Restores a snapshot target into the working directory without moving the current branch.
+    /// Restores a snapshot target into the working directory without moving the current cursor.
     pub async fn restore(
         &self,
         materializer: &dyn Materializer,
@@ -278,7 +539,7 @@ impl Repository {
         })
     }
 
-    /// Resolves a snapshot target from a full ID, unique prefix, or exact message.
+    /// Resolves a snapshot target from a full ID, branch/workspace ref, unique prefix, or exact message.
     pub async fn resolve_snapshot_target(
         &self,
         target: &str,
@@ -297,6 +558,28 @@ impl Repository {
             None
         };
         if let Some((snapshot_id, snapshot)) = full_id_snapshot {
+            return Ok(ResolvedSnapshot {
+                snapshot_id,
+                snapshot,
+            });
+        }
+
+        if let Ok(branch) = BranchName::new(target)
+            && branch_ref_exists(&self.metadata_dir, &branch).await?
+        {
+            let snapshot_id = read_branch_ref(&self.metadata_dir, &branch).await?;
+            let snapshot = self.object_store.get_snapshot(&snapshot_id).await?;
+            return Ok(ResolvedSnapshot {
+                snapshot_id,
+                snapshot,
+            });
+        }
+
+        if let Ok(workspace) = WorkspaceId::new(target)
+            && workspace_ref_exists(&self.metadata_dir, &workspace).await?
+        {
+            let snapshot_id = read_workspace_ref(&self.metadata_dir, &workspace).await?;
+            let snapshot = self.object_store.get_snapshot(&snapshot_id).await?;
             return Ok(ResolvedSnapshot {
                 snapshot_id,
                 snapshot,
@@ -339,10 +622,10 @@ impl Repository {
         read_head_branch(&self.metadata_dir).await
     }
 
-    /// Returns the current snapshot ID for HEAD's branch.
+    /// Returns the current snapshot ID for this handle's cursor.
     pub async fn current_snapshot_id(&self) -> Result<ObjectId, RepositoryError> {
-        let branch = self.current_branch().await?;
-        read_branch_ref(&self.metadata_dir, &branch).await
+        let cursor = self.current_cursor_reference().await?;
+        self.read_cursor_ref(&cursor).await
     }
 
     /// Returns the first-parent timeline from newest to oldest.
@@ -379,6 +662,17 @@ impl Repository {
         Ok(branch_ref_path(&self.metadata_dir, &branch))
     }
 
+    /// Returns the path used for this handle's current cursor ref file.
+    pub async fn current_cursor_ref_path(&self) -> Result<PathBuf, RepositoryError> {
+        let cursor = self.current_cursor_reference().await?;
+        Ok(match cursor {
+            CursorReference::Branch(branch) => branch_ref_path(&self.metadata_dir, &branch),
+            CursorReference::Workspace(workspace) => {
+                workspace_ref_path(&self.metadata_dir, &workspace)
+            }
+        })
+    }
+
     /// Returns the path used for the HEAD file.
     #[must_use]
     pub fn head_path(&self) -> PathBuf {
@@ -389,8 +683,11 @@ impl Repository {
         &self,
         materializer: &dyn Materializer,
     ) -> Result<Option<SnapshotResult>, RepositoryError> {
-        self.snapshot_if_changed(materializer, SnapshotRequest::automatic())
-            .await
+        let mut request = SnapshotRequest::automatic();
+        if let Some(workspace) = self.workspace_id() {
+            request = request.with_provenance_attribute("workspace", workspace.as_str());
+        }
+        self.snapshot_if_changed(materializer, request).await
     }
 
     async fn capture_snapshot(
@@ -436,6 +733,92 @@ impl Repository {
             snapshot,
             capture,
         })
+    }
+
+    async fn current_cursor_reference(&self) -> Result<CursorReference, RepositoryError> {
+        match &self.cursor {
+            RepositoryCursor::CurrentBranch => {
+                Ok(CursorReference::Branch(self.current_branch().await?))
+            }
+            RepositoryCursor::Workspace(workspace) => {
+                Ok(CursorReference::Workspace(workspace.clone()))
+            }
+        }
+    }
+
+    async fn acquire_cursor_lock(
+        &self,
+        cursor: &CursorReference,
+    ) -> Result<crate::refs::MetadataLock, RepositoryError> {
+        let path = match cursor {
+            CursorReference::Branch(branch) => branch_lock_path(&self.metadata_dir, branch),
+            CursorReference::Workspace(workspace) => {
+                workspace_ref_lock_path(&self.metadata_dir, workspace)
+            }
+        };
+        acquire_metadata_lock(path).await
+    }
+
+    async fn read_cursor_ref(&self, cursor: &CursorReference) -> Result<ObjectId, RepositoryError> {
+        match cursor {
+            CursorReference::Branch(branch) => read_branch_ref(&self.metadata_dir, branch).await,
+            CursorReference::Workspace(workspace) => {
+                read_workspace_ref(&self.metadata_dir, workspace).await
+            }
+        }
+    }
+
+    async fn write_cursor_ref(
+        &self,
+        cursor: &CursorReference,
+        snapshot_id: ObjectId,
+    ) -> Result<(), RepositoryError> {
+        match cursor {
+            CursorReference::Branch(branch) => {
+                write_branch_ref(&self.metadata_dir, branch, snapshot_id).await
+            }
+            CursorReference::Workspace(workspace) => {
+                write_workspace_ref(&self.metadata_dir, workspace, snapshot_id).await
+            }
+        }
+    }
+}
+
+impl CursorReference {
+    fn as_log_value(&self) -> String {
+        match self {
+            Self::Branch(branch) => format!("branch:{}", branch.as_str()),
+            Self::Workspace(workspace) => format!("workspace:{}", workspace.as_str()),
+        }
+    }
+}
+
+/// Information about the mutable cursor a repository handle operates on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorInfo {
+    /// The repository root uses the branch named by HEAD.
+    Branch(BranchName),
+    /// An external workspace uses its own workspace cursor.
+    Workspace(WorkspaceId),
+}
+
+impl CursorInfo {
+    /// Returns the user-facing cursor kind.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Branch(_) => "Branch",
+            Self::Workspace(_) => "Workspace",
+        }
+    }
+
+    /// Returns the user-facing cursor name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Branch(branch) => branch.as_str(),
+            Self::Workspace(workspace) => workspace.as_str(),
+        }
     }
 }
 
@@ -570,6 +953,17 @@ impl SnapshotRequest {
     }
 }
 
+/// Options for creating or adopting a connected workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddWorkspaceOptions {
+    /// Directory that should become a connected workspace.
+    pub path: PathBuf,
+    /// Workspace ID to register.
+    pub workspace_id: WorkspaceId,
+    /// Optional base snapshot/branch/workspace/label target. Defaults to the current saved state.
+    pub from: Option<String>,
+}
+
 /// Result returned when initializing a repository.
 #[derive(Debug, Clone)]
 pub struct InitResult {
@@ -590,12 +984,12 @@ pub struct SnapshotResult {
     pub capture: CaptureResult,
 }
 
-/// Status of the working tree relative to the current branch snapshot.
+/// Status of the working tree relative to the current cursor snapshot.
 #[derive(Debug, Clone)]
 pub struct WorkingTreeStatus {
-    /// Current branch snapshot ID.
+    /// Current cursor snapshot ID.
     pub snapshot_id: ObjectId,
-    /// Current branch snapshot contents.
+    /// Current cursor snapshot contents.
     pub snapshot: Snapshot,
     /// Root tree ID computed from the current working directory.
     pub current_root_tree_id: ObjectId,
@@ -628,6 +1022,36 @@ pub struct BranchHead {
     pub snapshot_id: ObjectId,
     /// Whether this branch is currently checked out.
     pub is_current: bool,
+}
+
+/// A connected workspace and the snapshot it points to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceHead {
+    /// Workspace ID.
+    pub id: WorkspaceId,
+    /// Snapshot ID stored in the workspace ref.
+    pub snapshot_id: ObjectId,
+    /// Registered workspace path.
+    pub path: Option<PathBuf>,
+    /// Whether this repository handle is opened in this workspace.
+    pub is_current: bool,
+}
+
+/// Result returned when adding or adopting a workspace.
+#[derive(Debug, Clone)]
+pub struct WorkspaceAddResult {
+    /// Workspace ID that was registered.
+    pub workspace_id: WorkspaceId,
+    /// Workspace path that was connected.
+    pub path: PathBuf,
+    /// Snapshot ID the workspace cursor points at.
+    pub snapshot_id: ObjectId,
+    /// Whether a new workspace registry record was created.
+    pub created: bool,
+    /// Whether Era materialized the base snapshot into the workspace.
+    pub materialized: bool,
+    /// Filesystem materialization result when a missing/empty workspace was populated.
+    pub materialization: Option<MaterializeResult>,
 }
 
 /// Result returned when creating a branch.
@@ -730,4 +1154,73 @@ async fn path_exists(path: &Path) -> Result<bool, RepositoryError> {
     fs::try_exists(path)
         .await
         .map_err(|source| io_error(path.to_path_buf(), source))
+}
+
+async fn directory_is_empty(path: &Path) -> Result<bool, RepositoryError> {
+    let mut reader = fs::read_dir(path)
+        .await
+        .map_err(|source| io_error(path.to_path_buf(), source))?;
+    Ok(reader
+        .next_entry()
+        .await
+        .map_err(|source| io_error(path.to_path_buf(), source))?
+        .is_none())
+}
+
+async fn absolute_existing_path(path: &Path) -> Result<PathBuf, RepositoryError> {
+    fs::canonicalize(path)
+        .await
+        .map_err(|source| io_error(path.to_path_buf(), source))
+}
+
+async fn absolute_path_for_create(path: &Path) -> Result<PathBuf, RepositoryError> {
+    if path_exists(path).await? {
+        return absolute_existing_path(path).await;
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let parent = absolute_existing_path(parent).await?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| RepositoryError::RootMissing {
+            path: path.to_path_buf(),
+        })?;
+    Ok(parent.join(name))
+}
+
+fn absolute_path_preserving_symlinks(path: &Path) -> Result<PathBuf, RepositoryError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    std::env::current_dir()
+        .map(|current| current.join(path))
+        .map_err(|source| io_error(path.to_path_buf(), source))
+}
+
+async fn metadata_argument(path: &Path) -> Result<Option<PathBuf>, RepositoryError> {
+    let metadata = match fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error(path.to_path_buf(), source)),
+    };
+    if !metadata.file_type().is_dir() {
+        return Ok(None);
+    }
+
+    if path.file_name().and_then(|name| name.to_str()) == Some("objects")
+        && let Some(parent) = path.parent()
+        && parent.file_name().and_then(|name| name.to_str()) == Some(".era")
+    {
+        return Ok(Some(parent.to_path_buf()));
+    }
+
+    if path.file_name().and_then(|name| name.to_str()) == Some(".era") {
+        return Ok(Some(path.to_path_buf()));
+    }
+
+    Ok(None)
 }

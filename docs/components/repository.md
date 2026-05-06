@@ -16,8 +16,9 @@ Repository code coordinates the object store and materializer, but it should not
 ├──────────────────────────────────────────────┤
 │ Refs and workspace cursors                   │
 │  - current cursor                            │
-│  - named ref heads                           │
-│  - current branch implementation             │
+│  - named branch refs                         │
+│  - workspace refs and registry records       │
+│  - scoped lock files for mutable metadata    │
 ├──────────────────────────────────────────────┤
 │ Snapshot orchestration                       │
 │  - labeled snapshots                         │
@@ -30,6 +31,11 @@ Repository code coordinates the object store and materializer, but it should not
 │  - working-tree status                       │
 │  - first-parent timeline                     │
 │  - snapshot target resolution                │
+├──────────────────────────────────────────────┤
+│ Workspace workflows                          │
+│  - add or adopt workspace paths              │
+│  - write external workspace pointer files    │
+│  - list workspace cursors                    │
 └──────────────────────────────────────────────┘
 ```
 
@@ -41,10 +47,13 @@ repository operation
    ├─ determine current workspace cursor / parent snapshot
    ├─ collect snapshot metadata and provenance
    ▼
-ask materializer to capture current tree
+ask materializer to capture current tree without holding a ref lock
    │
    ▼
 root tree ID
+   │
+   ▼
+lock only the current cursor ref and re-read its tip
    │
    ▼
 compare with cursor tip when request is changed-only
@@ -57,7 +66,10 @@ create snapshot object
 store snapshot through object store
    │
    ▼
-advance current cursor/ref
+atomically advance current cursor/ref
+   │
+   ▼
+release cursor lock
 ```
 
 Labeled snapshots use the same underlying object type as unlabeled snapshots. A label is optional metadata that makes a state easier to find; it is not the act that makes history exist. Unlabeled snapshot requests are changed-only so agents can call them repeatedly without creating duplicate states.
@@ -103,17 +115,36 @@ ask materializer to materialize target tree
 working directory reflects requested target
 ```
 
-The current implementation exposes branch refs and `switch` as the named-line mechanism. Architecturally, branch refs are one implementation of workspace cursors; future user-facing commands can prefer state/workspace vocabulary without changing the snapshot graph model.
+The current implementation exposes branch refs and `switch` as the repository-root named-line mechanism. External workspaces have their own refs under `.era/refs/workspaces/<id>`; switching inside such a workspace materializes the branch target and advances the workspace ref instead of changing global `HEAD`.
+
+## Workspace add flow
+
+```text
+era workspace add PATH
+   │
+   ├─ infer repo, workspace ID, and base snapshot when omitted
+   ├─ reject nested workspaces inside another workspace
+   ├─ create missing target directory if needed
+   ├─ safety-snapshot dirty source workspace when using inferred base
+   ├─ lock `.era/locks/workspaces/<id>.lock`
+   ├─ create `.era/refs/workspaces/<id>` when missing
+   ├─ write `.era/workspaces/<id>/path`
+   ├─ write `<workspace>/.era` pointer file
+   └─ materialize base tree only for missing or empty directories
+```
+
+A non-empty target directory is adopted as dirty relative to the base snapshot; Era does not overwrite it during add.
 
 ## Responsibilities
 
-- Initialize and open local repositories.
-- Manage current cursor/ref state and named references.
+- Initialize and open local repositories or connected workspaces.
+- Manage current cursor/ref state, workspace cursors, and named references.
 - Create snapshot objects with the correct parents and metadata.
 - Decide when changed-only snapshot requests should create or skip snapshots.
 - Save unsnapped work before context switches and restores.
-- Resolve snapshot targets by full ID, unique prefix, or exact label in the current timeline.
+- Resolve snapshot targets by full ID, branch/workspace ref name, unique prefix, or exact label in the current timeline.
 - Provide structured results for CLI and library clients.
+- Serialize mutable ref and workspace registry updates with scoped locks while leaving object writes lock-free.
 
 ## Boundaries
 
@@ -152,12 +183,12 @@ Those responsibilities belong to materialization, object-store, workspace-level 
 ## v0 constraints
 
 - Repository state is local-only.
-- The current CLI opens repositories from the working-directory root.
-- Timeline traversal is first-parent history from the current ref.
-- Branch refs are the current persisted cursor mechanism.
-- Merge, garbage collection, sync, and multi-workspace supervision are future work.
-- Workspace identity is currently captured as provenance for watch snapshots, not as a full workspace registry.
+- The CLI can open from a repository root, a connected workspace pointer, or lazily connect the current directory with `--repo`.
+- Timeline traversal is first-parent history from the current cursor ref.
+- Branch refs remain the repository-root named-line mechanism; workspace refs are the per-directory agent mechanism.
+- Merge, garbage collection, sync, and fleet supervision are future work.
+- Workspace registry records are lightweight path metadata; watcher loops and hash caches remain outside shared repo state.
 
 ## Future seams
 
-Repository is where richer policy belongs: merge, diff, tracking heuristics, provenance indexes, workspace registration, and sync coordination. Those features should preserve the boundary that shared repository state is objects, refs, graph metadata, and indexes, while watcher/debounce/hash-cache state remains workspace-scoped.
+Repository is where richer policy belongs: merge, diff, tracking heuristics, provenance indexes, workspace fleet supervision, and sync coordination. Those features should preserve the boundary that shared repository state is objects, refs, graph metadata, workspace registry records, and indexes, while watcher/debounce/hash-cache state remains workspace-scoped.

@@ -34,7 +34,7 @@ working directory
    ▼
 walk included paths
    │
-   ├─ skip excluded directories
+   ├─ skip excluded directories and `.era` workspace pointer files
    ├─ apply symlink policy
    └─ reuse cached file hashes when fingerprints match
    │
@@ -139,7 +139,7 @@ Those policies belong to the repository and CLI layers.
 
 - The current implementation is copy-based and local-filesystem-backed.
 - Hash caching is in-memory and scoped to one materializer instance.
-- Default tracking behavior is implemented as exact directory exclusions plus symlink policy.
+- Default tracking behavior is implemented as exact directory exclusions, preservation of `.era` metadata/pointer entries, plus symlink policy.
 - Symlinks are not followed.
 - Watchers are best-effort hints and must be paired with reconciliation.
 

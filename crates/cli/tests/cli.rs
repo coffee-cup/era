@@ -321,6 +321,112 @@ fn branch_switch_and_restore_support_local_workflow() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn workspace_add_creates_external_workspace_and_commands_infer_pointer()
+-> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path().join("project");
+    let agent = temp.path().join("agent-1");
+    fs::create_dir(&work)?;
+    fs::write(work.join("README.md"), b"one")?;
+    era(&work).arg("init").assert().success();
+
+    let add = era(&work)
+        .args(["workspace", "add", agent.to_str().unwrap()])
+        .assert()
+        .success();
+    let add_stdout = output_text(&add.get_output().stdout)?;
+    assert_no_ansi(&add_stdout);
+    assert!(add_stdout.starts_with("✓ Added workspace\n"));
+    assert_eq!(field_line_value(&add_stdout, "Workspace"), "agent-1");
+    assert_eq!(fs::read(agent.join("README.md"))?, b"one");
+    assert!(agent.join(".era").is_file());
+
+    let status = era(&agent).arg("status").assert().success();
+    let status_stdout = output_text(&status.get_output().stdout)?;
+    assert_eq!(field_line_value(&status_stdout, "Workspace"), "agent-1");
+    assert_eq!(field_line_value(&status_stdout, "Working"), "no changes");
+
+    fs::write(agent.join("README.md"), b"agent work")?;
+    era(&agent).arg("snap").assert().success();
+    let agent_status = era(&agent).arg("status").assert().success();
+    let agent_status_stdout = output_text(&agent_status.get_output().stdout)?;
+    assert_eq!(
+        field_line_value(&agent_status_stdout, "Working"),
+        "no changes"
+    );
+
+    let root_status = era(&work).arg("status").assert().success();
+    let root_status_stdout = output_text(&root_status.get_output().stdout)?;
+    assert_eq!(field_line_value(&root_status_stdout, "Branch"), "main");
+    assert_eq!(
+        field_line_value(&root_status_stdout, "Working"),
+        "no changes"
+    );
+    assert_eq!(fs::read(work.join("README.md"))?, b"one");
+
+    let list = era(&work).args(["workspace", "list"]).assert().success();
+    let list_stdout = output_text(&list.get_output().stdout)?;
+    assert!(list_stdout.contains("agent-1"));
+    assert!(list_stdout.contains(agent.to_str().unwrap()));
+
+    Ok(())
+}
+
+#[test]
+fn repo_workspace_options_lazily_connect_existing_directory() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let project = temp.path().join("project");
+    let agent = temp.path().join("agent-lazy");
+    fs::create_dir(&project)?;
+    fs::write(project.join("README.md"), b"base")?;
+    era(&project).arg("init").assert().success();
+    fs::create_dir(&agent)?;
+    fs::write(agent.join("README.md"), b"agent work")?;
+
+    let snap = era(&agent)
+        .args([
+            "snap",
+            "--repo",
+            project.to_str().unwrap(),
+            "--workspace",
+            "agent-lazy",
+        ])
+        .assert()
+        .success();
+    let snap_stdout = output_text(&snap.get_output().stdout)?;
+    assert!(snap_stdout.starts_with("✓ Created snapshot\n"));
+    assert!(agent.join(".era").is_file());
+
+    let status = era(&agent).arg("status").assert().success();
+    let status_stdout = output_text(&status.get_output().stdout)?;
+    assert_eq!(field_line_value(&status_stdout, "Workspace"), "agent-lazy");
+    assert_eq!(field_line_value(&status_stdout, "Working"), "no changes");
+
+    let list = era(&project).args(["workspace", "list"]).assert().success();
+    let list_stdout = output_text(&list.get_output().stdout)?;
+    assert!(list_stdout.contains("agent-lazy"));
+
+    Ok(())
+}
+
+#[test]
+fn workspace_add_rejects_nested_paths() -> Result<(), Box<dyn Error>> {
+    let temp = TempDir::new()?;
+    let work = temp.path();
+    era(work).arg("init").assert().success();
+
+    let nested = era(work)
+        .args(["workspace", "add", "agent-1"])
+        .assert()
+        .failure();
+    let stderr = output_text(&nested.get_output().stderr)?;
+    assert_no_ansi(&stderr);
+    assert!(stderr.contains("error: refusing to create a workspace inside another workspace"));
+
+    Ok(())
+}
+
+#[test]
 fn branch_switch_and_restore_report_clear_errors() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let work = temp.path();

@@ -4,14 +4,18 @@ mod branch;
 mod error;
 mod refs;
 mod repository;
+mod workspace;
 
 pub use branch::{BranchName, InvalidBranchName, InvalidBranchNameReason};
 pub use era_materialization::{TreeChange, TreeChangeKind};
 pub use error::RepositoryError;
 pub use repository::{
-    AutoSnapshotTrigger, BranchHead, BranchOperationResult, DEFAULT_WORKSPACE_ID, InitResult,
-    Repository, ResolvedSnapshot, RestoreResult, SnapshotRequest, SnapshotResult, SwitchResult,
-    TimelineEntry, WorkingTreeStatus,
+    AddWorkspaceOptions, AutoSnapshotTrigger, BranchHead, BranchOperationResult, CursorInfo,
+    InitResult, Repository, ResolvedSnapshot, RestoreResult, SnapshotRequest, SnapshotResult,
+    SwitchResult, TimelineEntry, WorkingTreeStatus, WorkspaceAddResult, WorkspaceHead,
+};
+pub use workspace::{
+    DEFAULT_WORKSPACE_ID, InvalidWorkspaceId, InvalidWorkspaceIdReason, WorkspaceId,
 };
 
 #[cfg(test)]

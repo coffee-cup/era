@@ -226,13 +226,13 @@ impl FilesystemMaterializer {
             let mut tree_entries = Vec::new();
 
             for entry in directory_entries {
-                if entry.file_type.is_dir() {
-                    if self.options.excludes_directory_name(&entry.name) {
-                        trace!(path = %entry.path.display(), "skipping excluded directory");
-                        stats.ignored_entries += 1;
-                        continue;
-                    }
+                if should_skip_entry(&self.options, &entry) {
+                    trace!(path = %entry.path.display(), "skipping excluded entry");
+                    stats.ignored_entries += 1;
+                    continue;
+                }
 
+                if entry.file_type.is_dir() {
                     let child_tree_id = self
                         .capture_directory(
                             entry.path.clone(),
@@ -308,13 +308,13 @@ impl FilesystemMaterializer {
             let mut tree_entries = Vec::new();
 
             for entry in directory_entries {
-                if entry.file_type.is_dir() {
-                    if self.options.excludes_directory_name(&entry.name) {
-                        trace!(path = %entry.path.display(), "skipping excluded directory");
-                        stats.ignored_entries += 1;
-                        continue;
-                    }
+                if should_skip_entry(&self.options, &entry) {
+                    trace!(path = %entry.path.display(), "skipping excluded entry");
+                    stats.ignored_entries += 1;
+                    continue;
+                }
 
+                if entry.file_type.is_dir() {
                     let child_tree_id = self
                         .scan_directory(
                             entry.path.clone(),
@@ -460,8 +460,8 @@ impl FilesystemMaterializer {
         let mut included_entries = Vec::new();
 
         for entry in directory_entries {
-            if entry.file_type.is_dir() && self.options.excludes_directory_name(&entry.name) {
-                trace!(path = %entry.path.display(), "skipping excluded directory");
+            if should_skip_entry(&self.options, &entry) {
+                trace!(path = %entry.path.display(), "skipping excluded entry");
                 state.stats.ignored_entries += 1;
                 continue;
             }
@@ -888,8 +888,8 @@ async fn prune_directory(
             continue;
         }
 
-        if entry.file_type.is_dir() && options.excludes_directory_name(&entry.name) {
-            trace!(path = %entry.path.display(), "preserving excluded directory");
+        if should_skip_entry(options, &entry) {
+            trace!(path = %entry.path.display(), "preserving excluded entry");
             continue;
         }
 
@@ -909,6 +909,11 @@ async fn prune_directory(
     }
 
     Ok(())
+}
+
+fn should_skip_entry(options: &CaptureOptions, entry: &DirectoryEntry) -> bool {
+    entry.name == ".era"
+        || (entry.file_type.is_dir() && options.excludes_directory_name(&entry.name))
 }
 
 async fn materialize_blob(
