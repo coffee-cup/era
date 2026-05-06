@@ -30,6 +30,8 @@ Save the current files if anything changed:
 era snap
 ```
 
+Today this is an explicit command or foreground `era watch`; with FUSE or a custom filesystem, this kind of changed-state capture could happen automatically as files are written.
+
 Mark an important state so it is easy to find later:
 
 ```sh
