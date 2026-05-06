@@ -1,5 +1,5 @@
 use anstyle::{AnsiColor, Style};
-use chrono::{DateTime, Local};
+use chrono::Local;
 use clap::{Parser, Subcommand};
 use era_core::{ObjectId, Snapshot};
 use era_materialization::{
@@ -43,12 +43,12 @@ struct Cli {
 enum Commands {
     /// Initialize an Era repository in the current directory.
     Init,
-    /// Capture a manual snapshot of the current repository.
+    /// Capture a snapshot if files changed, optionally attaching a label.
     Snap {
-        /// Human-facing label attached to the snapshot. Defaults to the current local time.
+        /// Optional human-facing label attached to the snapshot.
         #[arg(value_name = "LABEL", conflicts_with = "message")]
         label: Option<String>,
-        /// Human-facing label attached to the snapshot. Alias for the positional label.
+        /// Optional human-facing label attached to the snapshot. Alias for the positional label.
         #[arg(short, long, value_name = "MESSAGE")]
         message: Option<String>,
         /// Optional author recorded on the snapshot.
@@ -165,16 +165,30 @@ async fn snap(
     let materializer = FilesystemMaterializer::new();
     let repository = Repository::open(current_directory()?).await?;
     let branch = repository.current_branch().await?;
-    let message = message.or(label).unwrap_or_else(default_snapshot_message);
-    let mut request = SnapshotRequest::manual(message);
+    let message = message.or(label);
+    let has_label = message.is_some();
+    let mut request = match message {
+        Some(message) => SnapshotRequest::manual(message),
+        None => SnapshotRequest::manual_unlabeled(),
+    };
     if let Some(author) = author {
         request = request.with_author(author);
     }
 
-    let result = repository.snapshot(&materializer, request).await?;
+    if has_label {
+        let result = repository.snapshot(&materializer, request).await?;
+        print_snapshot_result("Created snapshot", &result, &branch, verbose);
+        print_capture_warnings(&result);
+    } else if let Some(result) = repository
+        .snapshot_if_changed(&materializer, request)
+        .await?
+    {
+        print_snapshot_result("Created snapshot", &result, &branch, verbose);
+        print_capture_warnings(&result);
+    } else {
+        anstream::println!("No changes");
+    }
 
-    print_snapshot_result("Created snapshot", &result, &branch, verbose);
-    print_capture_warnings(&result);
     Ok(())
 }
 
@@ -379,14 +393,6 @@ async fn timeline(verbose: bool) -> Result<(), CliError> {
 
 fn current_directory() -> Result<PathBuf, CliError> {
     std::env::current_dir().map_err(|source| CliError::CurrentDirectory { source })
-}
-
-fn default_snapshot_message() -> String {
-    format_snapshot_message_time(Local::now())
-}
-
-fn format_snapshot_message_time(timestamp: DateTime<Local>) -> String {
-    timestamp.format("%b %-d, %Y %H:%M:%S").to_string()
 }
 
 fn print_init_result(result: &era_repository::InitResult, branch: &BranchName, verbose: bool) {
@@ -768,6 +774,12 @@ fn timeline_title(snapshot: &Snapshot) -> String {
                 format_snapshot_time(snapshot.timestamp_millis())
             )
         }
+        _ if snapshot.provenance().source() == "manual-snapshot" => {
+            format!(
+                "snapshot · {}",
+                format_snapshot_time(snapshot.timestamp_millis())
+            )
+        }
         _ => snapshot.provenance().source().to_owned(),
     }
 }
@@ -910,21 +922,6 @@ fn tracing_filter_from_directive(directive: Option<String>) -> EnvFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_snapshot_message_uses_readable_local_time() {
-        use chrono::TimeZone as _;
-
-        let timestamp = Local
-            .with_ymd_and_hms(2024, 1, 1, 11, 11, 11)
-            .single()
-            .expect("test timestamp should exist in the local timezone");
-
-        assert_eq!(
-            format_snapshot_message_time(timestamp),
-            "Jan 1, 2024 11:11:11"
-        );
-    }
 
     #[test]
     fn tracing_filter_accepts_valid_directive() {

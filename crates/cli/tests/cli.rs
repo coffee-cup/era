@@ -346,16 +346,36 @@ fn branch_switch_and_restore_report_clear_errors() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
-fn snap_without_message_uses_timestamp_message() -> Result<(), Box<dyn Error>> {
+fn snap_without_label_saves_only_when_files_changed() -> Result<(), Box<dyn Error>> {
     let temp = TempDir::new()?;
     let work = temp.path();
+    fs::write(work.join("README.md"), b"one")?;
     era(work).arg("init").assert().success();
 
-    let snap = era(work).arg("snap").assert().success();
-    let stdout = output_text(&snap.get_output().stdout)?;
-    let message = field_line_value(&stdout, "Message");
+    let clean_snap = era(work).arg("snap").assert().success();
+    let clean_stdout = output_text(&clean_snap.get_output().stdout)?;
+    assert_eq!(clean_stdout, "No changes\n");
 
-    assert_timestamp_message(message)?;
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+    assert_eq!(lines(&timeline_stdout).len(), 2);
+
+    fs::write(work.join("README.md"), b"two")?;
+    let snap = era(work).arg("snap").assert().success();
+    let snap_stdout = output_text(&snap.get_output().stdout)?;
+    assert!(snap_stdout.starts_with("✓ Created snapshot\n"));
+    assert!(!snap_stdout.contains("Message"));
+    assert_short_object_id(field_line_value(&snap_stdout, "Snapshot"));
+
+    let status = era(work).arg("status").assert().success();
+    let status_stdout = output_text(&status.get_output().stdout)?;
+    assert_eq!(field_line_value(&status_stdout, "Working"), "no changes");
+
+    let timeline = era(work).arg("timeline").assert().success();
+    let timeline_stdout = output_text(&timeline.get_output().stdout)?;
+    let timeline_lines = lines(&timeline_stdout);
+    assert_eq!(timeline_lines.len(), 3);
+    assert!(timeline_lines[1].contains("snapshot · "));
     Ok(())
 }
 
@@ -393,45 +413,6 @@ fn assert_short_object_id(value: &str) {
 fn assert_object_id(value: &str) {
     assert_eq!(value.len(), 64, "object ID should be 64 hex chars");
     assert_hex(value);
-}
-
-fn assert_timestamp_message(value: &str) -> Result<(), Box<dyn Error>> {
-    let mut parts = value.split_whitespace();
-    let month = parts.next().expect("timestamp should have month");
-    let day = parts.next().expect("timestamp should have day");
-    let year = parts.next().expect("timestamp should have year");
-    let time = parts.next().expect("timestamp should have time");
-    assert!(parts.next().is_none(), "timestamp should have four fields");
-    assert!(
-        matches!(
-            month,
-            "Jan"
-                | "Feb"
-                | "Mar"
-                | "Apr"
-                | "May"
-                | "Jun"
-                | "Jul"
-                | "Aug"
-                | "Sep"
-                | "Oct"
-                | "Nov"
-                | "Dec"
-        ),
-        "unexpected month: {month}"
-    );
-    assert!(day.ends_with(','), "day should end with comma: {day}");
-    let day_number = day.trim_end_matches(',').parse::<u8>()?;
-    assert!((1..=31).contains(&day_number));
-    let year_number = year.parse::<u16>()?;
-    assert!(year_number >= 2024);
-    let time_parts = time.split(':').collect::<Vec<_>>();
-    assert_eq!(time_parts.len(), 3, "time should be HH:MM:SS");
-    for part in time_parts {
-        assert_eq!(part.len(), 2, "time fields should be zero-padded");
-        assert!(part.parse::<u8>().is_ok(), "time field should be numeric");
-    }
-    Ok(())
 }
 
 fn assert_hex(value: &str) {

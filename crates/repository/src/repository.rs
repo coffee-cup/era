@@ -483,13 +483,24 @@ impl SnapshotRequest {
         }
     }
 
-    /// Creates request metadata for a manually requested snapshot.
+    /// Creates request metadata for a manually requested labeled snapshot.
     #[must_use]
     pub fn manual(message: impl Into<String>) -> Self {
         Self {
             timestamp_millis: None,
             author: None,
             message: Some(message.into()),
+            provenance: SnapshotProvenance::manual(),
+        }
+    }
+
+    /// Creates request metadata for a manually requested unlabeled snapshot.
+    #[must_use]
+    pub fn manual_unlabeled() -> Self {
+        Self {
+            timestamp_millis: None,
+            author: None,
+            message: None,
             provenance: SnapshotProvenance::manual(),
         }
     }

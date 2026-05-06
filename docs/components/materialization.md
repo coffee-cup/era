@@ -108,7 +108,7 @@ Filesystem watcher events are hints, not proof. The repository and CLI flows rec
 Materialization does not:
 
 - Create snapshot objects.
-- Advance branch refs.
+- Advance refs or workspace cursors.
 - Decide whether an automatic snapshot should be skipped.
 - Own shared repository metadata.
 - Interpret labels, authors, or provenance beyond data passed through by callers.

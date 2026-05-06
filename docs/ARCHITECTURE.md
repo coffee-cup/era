@@ -1,6 +1,6 @@
 # Architecture
 
-A version control system designed for the era of agentic work: where snapshots are free, branching is instant, history is dense, and the storage substrate is built for both humans and the millions of parallel agents that will use it.
+A version control system designed for the era of agentic work: where snapshots are free, divergence is natural, history is dense, and the storage substrate is built for both humans and the millions of parallel agents that will use it.
 
 This document describes the architecture at a conceptual level. It focuses on **v0** — the smallest system that proves the thesis — while noting where future work (notably FUSE) will plug in.
 
@@ -8,12 +8,12 @@ This document describes the architecture at a conceptual level. It focuses on **
 
 ## Thesis
 
-Version control today is built around a 2005 mental model: a working directory, a staging area, and commits made by a careful human who remembers to `git add`. That model strains under modern workloads, and breaks entirely when the "user" is a fleet of agents producing thousands of parallel branches per hour.
+Version control today is built around a 2005 mental model: a working directory, a staging area, branches, and commits made by a careful human who remembers to `git add`. That model strains under modern workloads, and breaks entirely when the "user" is a fleet of agents producing thousands of parallel futures per hour.
 
 This project is built on three claims:
 
-1. **Snapshots should be free.** The whole tree, captured at every meaningful moment, costs almost nothing if the storage is content-addressed and copy-on-write. There is no reason to ask the user what to commit. There is no reason for a staging area.
-2. **Branching should be instant.** Forking is a pointer write. A thousand agent branches should cost megabytes, not gigabytes.
+1. **Snapshots should be free.** The whole tree, captured whenever files change, costs almost nothing if the storage is content-addressed and copy-on-write. There is no reason to ask the user what to commit. There is no reason for a staging area.
+2. **Divergence should be natural.** If a workspace goes back to an older state and edits from there, history should fork because the files changed — not because the user predeclared a branch.
 3. **Time travel should be a primitive operation.** Reading the tree at any past moment should be as cheap as reading it now.
 
 Everything in the architecture follows from these claims.
@@ -25,7 +25,7 @@ Everything in the architecture follows from these claims.
 - **Content-addressed everywhere.** Identity is hash, not path. Two identical files are stored once. Two identical trees are stored once. Reproducibility, deduplication, and integrity fall out for free.
 - **Copy-on-write at every layer.** Snapshots share storage with their parents. Only what changes costs anything.
 - **Provenance is structured, not a string.** Every snapshot records who (or what) made it, with what tools, from what parent action. Agent-generated history is auditable by construction.
-- **No staging, no manual tracking.** The system observes the working tree and decides what matters. Users describe intent at moments they care about; the system records everything else automatically.
+- **No staging, no manual tracking.** The system observes the working tree and decides what matters. Users and agents can rapid-fire "snapshot if changed"; labels are optional annotations for convenience, not the act that makes history exist.
 - **Layers are honest.** What the data is (the object store) and how files appear on disk (materialization) are separate concerns with a narrow interface between them. Future implementations slot into the seam without touching everything else.
 - **Minimum effective abstraction.** Build the smallest thing that makes the thesis testable. Add complexity only when a real workload demands it.
 
@@ -45,23 +45,29 @@ In the current implementation, tree entries use UTF-8 single-segment names. Emoj
 
 This is the object-level copy-on-write magic: changing a single file in a deeply nested directory writes a new blob for that full file, the tree containing it, and the trees on the path back to the root. Everything else is shared with the prior state. The current implementation does not do filesystem-level CoW, block-level chunking, or delta compression; if one byte changes in a large file, the changed file is stored as a new full blob.
 
+### State
+
+A state is the full content tree of the project at a moment: all tracked files and directories, independent of names like branch or commit. The current state of a working directory can be derived by scanning the files and computing the root tree ID.
+
 ### Snapshot
 
-A complete record of the entire tree at a moment in time. A snapshot points to the root tree, references its parent snapshot(s), and carries structured metadata: timestamp, author, optional human-readable message, and provenance (what tool or agent produced it, what action it corresponded to).
+A persisted state with history. A snapshot points to the root tree, references its parent snapshot(s), and carries structured metadata: timestamp, author, optional human-readable message, and provenance (what tool or agent produced it, what action it corresponded to).
 
-In the current implementation, snapshots have deterministic canonical bytes and content-addressed IDs. Small golden fixtures lock the v1 snapshot encoding for compatibility. Snapshots form a directed acyclic graph via their parent pointers. A linear sequence of snapshots looks like git's commit history. Merges produce snapshots with multiple parents. Branches are simply named pointers into the graph.
+In the current implementation, snapshots have deterministic canonical bytes and content-addressed IDs. Small golden fixtures lock the v1 snapshot encoding for compatibility. Snapshots form a directed acyclic graph via their parent pointers. A linear sequence of snapshots is just one path through the graph. If a workspace restores an old state and then records new changes, the graph naturally diverges from that old state.
 
-There is no distinction between "auto-snapshots" and "commits" in the storage layer — they are the same object. The difference is only whether a human-readable label was attached. Tooling treats labeled snapshots as the meaningful waypoints and unlabeled ones as the dense history between them.
+There is no distinction between "auto-snapshots" and "commits" in the storage layer — they are the same object. The default behavior should be unlabeled, changed-only snapshots. Human-readable labels are optional annotations that make important states easy to find again; they are not required for history to exist.
 
-### Branch
+### Workspace Cursor / Line of Work
 
-A named, mutable pointer to a snapshot. Creating a branch is writing a small reference; switching branches is changing which snapshot the working directory reflects. Branches are not isolated worlds — they are just labeled positions in the snapshot graph, and they share all underlying storage.
+The current file state can be derived from the directory, but the next history edge cannot always be derived from files alone. The system still needs a cursor for each workspace that answers: "if these files changed, which snapshot is their parent?" This cursor preserves causality, disambiguates identical file trees that appear at different points in history, and lets restore/time-travel fork from the state the user actually chose.
 
-### Working Directory
+The current implementation stores these cursors as branch refs and exposes `era branch` / `era switch`. Architecturally, those refs are an implementation of named lines of work, not a commitment that Git-style branches are the permanent user model. Future UX can hide or rename them behind state/workspace commands while keeping the same graph semantics.
 
-A materialized view of a particular snapshot at a path on the user's filesystem. The working directory is the only place where files exist as ordinary bytes that ordinary tools can read and write. Everything else lives in the object store as content-addressed objects.
+### Working Directory / Workspace
 
-The current state of the working directory may match a known snapshot exactly, or it may have drifted — files added, modified, or deleted relative to the last snapshot. The system continuously observes this drift and turns it into new snapshots automatically.
+A workspace is a materialized directory plus its local execution context. The working directory is the place where files exist as ordinary bytes that tools can read and write. Everything else lives in the object store as content-addressed objects.
+
+The current state of the working directory may match a known snapshot exactly, or it may have drifted — files added, modified, or deleted relative to the workspace cursor. The system observes this drift and turns it into new snapshots automatically or when asked to "snapshot if changed."
 
 ### Provenance
 
@@ -93,12 +99,12 @@ These companion documents expand the architecture by component and should stay a
 - [Core](components/core.md) — shared object identity, tree, snapshot, and provenance model.
 - [Object Store](components/object-store.md) — content-addressed persistence and integrity verification.
 - [Materialization](components/materialization.md) — working-directory capture, comparison, restore, watching, and hash caching.
-- [Repository](components/repository.md) — refs, branches, snapshot policy, status, timeline, switch, and restore orchestration.
+- [Repository](components/repository.md) — refs/cursors, snapshot policy, status, timeline, switch, and restore orchestration.
 - [CLI](components/cli.md) — command surface, terminal output, tracing setup, and foreground watch loop.
 
 ### Object Store
 
-The bottom layer. Knows nothing about paths, branches, or history. Speaks purely in hashes and bytes.
+The bottom layer. Knows nothing about paths, workspace cursors, or history. Speaks purely in hashes and bytes.
 
 Responsibilities:
 
@@ -123,22 +129,22 @@ Responsibilities:
 
 In v0, materialization works by ordinary file operations — copying bytes from the object store onto the filesystem, walking the working tree to detect changes, and using a platform-appropriate filesystem watcher to observe writes. The materialization API should still be async and capability-oriented from the start, so repository code does not depend on the copy-based implementation detail.
 
-The current implementation covers both directions for local workflows. `FilesystemMaterializer` can capture a working directory into blob/tree objects, scan a working directory without storing objects to compute the tree ID that status compares, compare a working directory with a stored tree to produce path-level added/modified/deleted/type-changed status entries, watch a working directory for filesystem change hints, and materialize a stored tree back into the working directory for branch switching and restore. Capture, scan, and compare use a per-materializer in-memory hash cache so a long-running watcher can reuse unchanged file hashes. Capture, scan, compare, and watch filtering use configurable exact directory-name exclusions; defaults skip Era metadata, Git metadata, and common generated/transient directories such as `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`. Symlinks are not followed; by default they are skipped and reported, and callers can choose an error policy instead. Materialization preserves excluded directories that are outside the target tree, including `.era`, so repository metadata and generated caches are not deleted during restore.
+The current implementation covers both directions for local workflows. `FilesystemMaterializer` can capture a working directory into blob/tree objects, scan a working directory without storing objects to compute the tree ID that status compares, compare a working directory with a stored tree to produce path-level added/modified/deleted/type-changed status entries, watch a working directory for filesystem change hints, and materialize a stored tree back into the working directory for context switching and restore. Capture, scan, and compare use a per-materializer in-memory hash cache so a long-running watcher can reuse unchanged file hashes. Capture, scan, compare, and watch filtering use configurable exact directory-name exclusions; defaults skip Era metadata, Git metadata, and common generated/transient directories such as `target`, `node_modules`, `.next`, `dist`, `build`, `.cache`, and `__pycache__`. Symlinks are not followed; by default they are skipped and reported, and callers can choose an error policy instead. Materialization preserves excluded directories that are outside the target tree, including `.era`, so repository metadata and generated caches are not deleted during restore.
 
 This layer is intentionally a replaceable component. Future implementations (hardlink-based, reflink-based, FUSE-based) will plug in here without changing anything above. The interface this layer presents to the repository is small and stable: "checkout this snapshot at this path," "what does this path look like now," "tell me when something changes."
 
 ### Repository
 
-The orchestration layer. Knows about branches, history, snapshots-in-context, and the policies that govern when and how snapshots are taken.
+The orchestration layer. Knows about history, snapshots-in-context, workspace cursors/refs, and the policies that govern when and how snapshots are taken.
 
 Responsibilities:
 
-- Manage branches and their references
-- Apply snapshot policy for manual, automatic, and safety snapshots
-- Implement higher-level operations: diff between snapshots, walk history, merge branches
+- Manage refs that anchor workspace cursors or named lines of work
+- Apply snapshot policy for labeled, unlabeled, automatic, and safety snapshots
+- Implement higher-level operations: diff between snapshots, walk history, merge divergent lines of work
 - Coordinate tracking policy with the materialization layer's include/exclude behavior
 
-The current repository implementation covers local init, open, manual snapshots, changed-only automatic snapshots, first-parent timeline walking, path-aware working-tree status comparison, branch listing/creation/switching, and whole-tree restore. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Manual snapshots capture the current tree, store a snapshot with the current branch tip as parent, and advance the branch ref. Automatic snapshot requests capture the current tree and advance the branch only when the root tree differs from the current snapshot, avoiding duplicate history entries. Status compares the working tree to the current branch snapshot and reports the root tree comparison plus sorted path-level changes. Branch creation writes another ref pointing at the current saved snapshot. Switching branches and restoring snapshots save unsnapped work first, then ask the materializer to reconcile the working directory. Restore materializes a target snapshot without moving the current branch ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
+The current repository implementation covers local init, open, labeled user-requested snapshots, changed-only unlabeled snapshots, changed-only automatic snapshots, first-parent timeline walking, path-aware working-tree status comparison, branch listing/creation/switching, and whole-tree restore. Init creates `.era/HEAD`, `.era/refs/heads/main`, and `.era/objects`, captures the working directory through the materializer, stores an initial snapshot, and points `main` at it. Labeled snapshots capture the current tree, store a snapshot with the current ref tip as parent, and advance the ref even if the tree did not change so the label has a durable place to live. Unlabeled snapshot requests capture the current tree and advance the ref only when the root tree differs from the current snapshot, avoiding duplicate history entries. Status compares the working tree to the current ref snapshot and reports the root tree comparison plus sorted path-level changes. Branch creation writes another ref pointing at the current saved snapshot. Switching branches and restoring snapshots save unsnapped work first, then ask the materializer to reconcile the working directory. Restore materializes a target snapshot without moving the current ref. Snapshot metadata includes a timestamp, optional author, optional message, and structured provenance.
 
 The repository is where intelligence lives. It is also where most of the v0 design space is, because the rules for "when do we snapshot, what do we include, how do we merge" are precisely what differentiates this system from git.
 
@@ -148,7 +154,7 @@ The user-facing surface. A thin layer that translates user intent into repositor
 
 The library API is the primary interface; the CLI is a thin shell over it. This ordering matters: the library should be usable directly from agent harnesses, editor plugins, and other tooling without going through a subprocess. Agents are first-class clients.
 
-The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap`, `era snap "label"`, `era snap --message "..."`, `era status`, `era branch`, `era branch NAME`, `era switch NAME`, `era restore SNAPSHOT_OR_LABEL`, `era watch`, `era watch --once`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era snap` is the single user-facing "remember this state" command: it accepts an optional label and defaults to the current local timestamp formatted like `Jan 1, 2024 11:11:11`. `era status` compares the working tree to the current saved snapshot, reports whether changes are detected, and lists changed paths with `A`, `M`, `D`, or `T` markers when dirty. `era watch` runs in the foreground, debounces filesystem events, periodically reconciles the full tree, and creates unlabeled automatic snapshots when the tree changed. Watch snapshots use structured provenance attributes for `trigger`, `workspace`, and optional agent/task/model fields; the timestamp shown in timeline output is a display title, not a stored label.
+The current CLI exposes the implemented repository workflows from the current directory: `era init`, `era snap`, `era snap "label"`, `era snap --message "..."`, `era status`, `era branch`, `era branch NAME`, `era switch NAME`, `era restore SNAPSHOT_OR_LABEL`, `era watch`, `era watch --once`, and `era timeline`. It uses the filesystem materializer and local repository APIs directly, prints clean concise output by default, provides a global `--verbose` flag for debugging details, uses adaptive terminal colors when supported, sends diagnostics and tracing to stderr, and keeps tracing disabled unless `ERA_LOG` or `RUST_LOG` is set. `era snap` without a label is the rapid-fire "snapshot if files changed" command and creates an unlabeled snapshot only when the current tree differs from the current ref. `era snap "label"` / `era snap --message "..."` attaches a human-readable label to the current state. `era status` compares the working tree to the current saved snapshot, reports whether changes are detected, and lists changed paths with `A`, `M`, `D`, or `T` markers when dirty. `era watch` runs in the foreground, debounces filesystem events, periodically reconciles the full tree, and creates unlabeled automatic snapshots when the tree changed. Watch snapshots use structured provenance attributes for `trigger`, `workspace`, and optional agent/task/model fields; the timestamp shown in timeline output is a display title, not a stored label. The `branch` and `switch` commands expose the current branch-ref implementation; they are useful for v0 but not sacred user vocabulary.
 
 ---
 
@@ -214,15 +220,23 @@ _Contrast with git:_ no `add`, no `commit`, no commit-message-for-every-change. 
 
 ### Remembering a Meaningful Moment
 
-When the user finishes something they want to remember — a feature, a refactor, a known-good state before risky changes — they use one command:
+When the user or an agent wants to make sure work is recorded, they can rapid-fire:
+
+```
+era snap
+```
+
+This means "snapshot if files changed." If the current tree matches the workspace cursor, Era does nothing. If the files differ, Era creates an unlabeled snapshot and advances the current line of work.
+
+When the user finishes something they want to find by name later — a feature, a refactor, a known-good state before risky changes — the label is optional:
 
 ```
 era snap "feature: cellular automata loading spinner"
 ```
 
-From the user's point of view, `era snap` means "make this current state easy to get back to." If the tree has not been saved yet, Era saves it and attaches the label. If the exact tree is already saved, Era can represent the label without making the user think about capture versus metadata. In the current implementation, this command creates a snapshot object with the current root tree and the supplied message, so the timeline shows the label as the headline.
+This means "attach a human-readable name to this state." If the tree has not been saved yet, Era saves it and attaches the label. If the exact tree is already saved, Era can represent the label without making the user think about capture versus metadata. In the current implementation, this creates a snapshot object with the current root tree and the supplied message, so the timeline shows the label as the headline.
 
-_Contrast with git:_ the closest analog is `git commit -m`, but there is no staging area and no separate `mark` command for users to learn.
+_Contrast with git:_ the closest analog is `git commit -m`, but Era does not require a message for every saved state and does not have a staging area.
 
 ### Going Back in Time
 
@@ -235,31 +249,33 @@ era restore abc123def456
 
 Time travel is a primitive operation. The current implementation restores whole trees by exact label, unique snapshot ID prefix, or full snapshot ID. The user does not check out a commit and then remember to come back — they ask for what they want, and the working directory becomes that.
 
-Before restore changes the working directory, Era saves any unsnapped current work, so nothing is lost by traveling.
+Before restore changes the working directory, Era saves any unsnapped current work, so nothing is lost by traveling. Current `restore` does not move the current ref; a future `go`-style command should update the workspace cursor to the selected state so later edits naturally diverge from that state.
 
 _Contrast with git:_ `reflog` and `checkout` exist for this with caveats — uncommitted work blocks switching, the reflog is technical and ephemeral, restoring a single file requires `git show <commit>:path > path`.
 
-### Branching for an Experiment
+### Diverging for an Experiment
 
-The user wants to try something risky without affecting their main line.
+The user wants to try something risky from an older or current state. Conceptually, they do not need to create a branch first: they go to the state they want, edit files, and the next snapshot naturally creates a new future from that parent.
 
+```text
+A -- B -- C
+ \
+  D -- E
 ```
-era branch try-new-approach
-```
 
-A branch is a named pointer to a saved snapshot. Creating it is instantaneous and costs essentially nothing; if the working tree has unsnapped changes, Era saves them first and then creates the branch at that saved state. The user works on the branch; snapshots accumulate on it. If the experiment works, they merge. If not, they discard the branch — and even then, the work remains reachable through the timeline until garbage-collected.
+The fork exists because state `A` gained another child, not because the user performed a special branch ceremony. In the current v0 CLI, `era branch NAME` still exposes named refs for convenience and for context switching, but the architecture should treat those as named cursors over the graph rather than the core user model.
 
-_Contrast with git:_ `git checkout -b`, but without uncommitted changes blocking the switch and without the worktree/disk overhead of multiple branches existing simultaneously.
+_Contrast with git:_ no need to predeclare a branch before experimentation, and no uncommitted-change blocker before moving through history.
 
 ### Switching Contexts
 
-The user is mid-task, gets pulled into something else, and needs to switch branches.
+The user is mid-task, gets pulled into something else, and needs to move the workspace to another named line of work.
 
 ```
 era switch main
 ```
 
-Era saves the current state — including any in-progress work — on the current branch before materializing the target branch. Switching loses nothing. When the user returns later, they pick up exactly where they left off.
+Era saves the current state — including any in-progress work — on the current line before materializing the target line. Switching loses nothing. When the user returns later, they pick up exactly where they left off. The command name is current implementation vocabulary; future UX may prefer `go`, `resume`, or workspace commands.
 
 _Contrast with git:_ no `git stash` dance, no "your local changes would be overwritten" error, no half-staged work caught between branches.
 
@@ -280,13 +296,13 @@ _Contrast with git:_ `git log` exists, but author is a free-form string, and "ev
 
 ### Working with an Agent Fleet
 
-A user (or another agent) spawns ten coding agents to attempt the same task in parallel. Each gets its own branch, forked from the current state.
+A user (or another agent) spawns ten coding agents to attempt the same task in parallel. Each gets its own workspace cursor starting from the same state.
 
 ```
-era fanout agent-{1..10} from main
+era fanout agent-{1..10} from abc123
 ```
 
-Each agent works in its own materialized workspace (eventually, its own FUSE mount), reading and writing freely. Each write produces an unlabeled auto-snapshot with structured provenance for the workspace, agent, model, and task. When the agents finish, the user reviews the resulting branches, picks the winner, merges it, and discards the rest.
+Each agent works in its own materialized workspace (eventually, its own FUSE mount), reading and writing freely. Each write produces an unlabeled auto-snapshot with structured provenance for the workspace, agent, model, and task. When the agents finish, the user reviews the resulting futures, picks the winner, merges it, and discards the rest.
 
 The total storage cost is dominated by the actual changes the agents made — typically kilobytes each — not by ten copies of the repository. This is the model that makes agent-scale parallelism economical.
 
@@ -304,11 +320,11 @@ _Contrast with git:_ hope you committed. If you didn't, you're using your editor
 
 ### Resolving a Conflict
 
-When a merge can't be resolved automatically, the system produces a structured conflict. For v0 this is at the file level: "these files were modified on both branches in incompatible ways, here are both versions."
+When a merge can't be resolved automatically, the system produces a structured conflict. For v0 this is at the file level: "these files were modified on both divergent futures in incompatible ways, here are both versions."
 
-The user resolves the conflicts in their editor (conflict files appear as ordinary files in the working directory). Once resolved, the user marks the merge complete; the system snapshots the resolved state with both branches as parents.
+The user resolves the conflicts in their editor (conflict files appear as ordinary files in the working directory). Once resolved, the user marks the merge complete; the system snapshots the resolved state with both parent snapshots recorded.
 
-In v1+, syntax-aware merge will collapse entire categories of "conflict" that aren't really conflicts — two branches both adding imports, two branches modifying different functions in the same file. For v0, file-level is the boundary.
+In v1+, syntax-aware merge will collapse entire categories of "conflict" that aren't really conflicts — two futures both adding imports, two futures modifying different functions in the same file. For v0, file-level is the boundary.
 
 ---
 
@@ -323,7 +339,7 @@ To make the layers concrete, here is what happens when a file changes:
 5. **For any file whose hash is new**, the materializer hands the bytes to the object store, which stores them and returns a hash. (Most files are unchanged and produce no new objects.)
 6. **The materializer builds tree objects** from the bottom up, again writing only new trees to the object store. Most trees are reused from the previous snapshot.
 7. **The repository builds a snapshot object** referencing the new root tree, the previous snapshot as its parent, the current timestamp, and any provenance supplied by the agent or user.
-8. **The repository updates the current branch's reference** to point at the new snapshot.
+8. **The repository updates the current workspace cursor / ref** to point at the new snapshot.
 
 The total cost: a few hashes, a few small writes, a pointer update. Sub-100ms even on a large repository, well under the auto-snapshot debounce window.
 
@@ -349,9 +365,9 @@ These are real and important problems that v0 explicitly does not solve, in serv
 
 The materialization layer exists, in part, so that FUSE can eventually be added without disrupting anything else.
 
-In v0, materialization works by copying bytes between the object store and ordinary files on disk. This is simple, portable, debuggable, and fast enough for normal use. It has one significant limitation: every working directory costs real disk space, and switching branches costs real I/O.
+In v0, materialization works by copying bytes between the object store and ordinary files on disk. This is simple, portable, debuggable, and fast enough for normal use. It has one significant limitation: every working directory costs real disk space, and moving a workspace between states costs real I/O.
 
-A FUSE-based materializer would change this. The working directory becomes a virtual filesystem mount backed directly by the object store. Switching branches is a pointer change with no I/O. Multiple working directories on different branches share storage automatically. A hundred agents, each in its own branch, each in its own working directory, become essentially free.
+A FUSE-based materializer would change this. The working directory becomes a virtual filesystem mount backed directly by the object store. Moving a workspace cursor is a pointer change with no I/O. Multiple workspaces on different states share storage automatically. A hundred agents, each with its own workspace and cursor, become essentially free.
 
 The FUSE materializer will be a peer of the copy-based one, not a replacement: each has its tradeoffs (FUSE costs syscall overhead and brings platform-specific complexity; copying costs disk and I/O). Users and agents pick what suits their workload.
 

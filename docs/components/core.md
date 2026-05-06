@@ -22,7 +22,7 @@ The core component has no filesystem responsibility, no repository state, and no
 │ Snapshot model                               │
 │  - root tree                                 │
 │  - parent snapshots                          │
-│  - timestamp, author, label                  │
+│  - timestamp, author, optional message/label │
 │  - structured provenance attributes          │
 └──────────────────────────────────────────────┘
 ```
@@ -65,7 +65,7 @@ Core does not:
 
 - Store objects on disk.
 - Read or write working-directory files.
-- Manage branches, refs, or repository metadata.
+- Manage refs, workspace cursors, or repository metadata.
 - Decide when snapshots should be created.
 - Render user-facing CLI output.
 
@@ -104,6 +104,7 @@ Every component uses the core domain model. Core remains intentionally small so 
 - Tree names are UTF-8 single path segments.
 - Tree ordering is deterministic and based on exact entry names.
 - Snapshots are immutable content-addressed records.
+- Labels are optional snapshot metadata, not required save points.
 - Provenance is structured metadata on snapshots, not a free-form log convention.
 
 ## Future seams

@@ -33,6 +33,8 @@ The CLI should stay thin. Durable behavior belongs in the repository, materializ
 └──────────────────────────────────────────────┘
 ```
 
+The current command surface still includes `branch` and `switch` because v0 persists named lines as branch refs. That vocabulary is not sacred: future CLI work can introduce state/workspace-oriented commands such as `go`, `mark`, `resume`, or workspace management while keeping the repository APIs underneath.
+
 ## Command flow
 
 ```text
@@ -53,6 +55,24 @@ call repository API
    ▼
 format structured result for terminal output
 ```
+
+## Snapshot command flow
+
+```text
+era snap [optional label]
+   │
+   ▼
+capture current tree
+   │
+   ├─ no label and unchanged ──► print "No changes"
+   ├─ no label and changed ────► create unlabeled snapshot
+   └─ label supplied ──────────► create labeled snapshot for current state
+   │
+   ▼
+print snapshot result
+```
+
+`era snap` without a label is intentionally rapid-fire and changed-only. Agents can call it after each tool action without worrying about duplicate snapshots. `era snap "label"` and `era snap --message "..."` are convenience forms for making a state easy to find by name.
 
 ## Watch flow
 
@@ -92,7 +112,7 @@ CLI does not:
 - Define object formats.
 - Store objects directly.
 - Walk or restore the working directory directly.
-- Own branch or snapshot policy beyond command-level intent.
+- Own ref/cursor or snapshot policy beyond command-level intent.
 - Act as the only supported integration path for agents or tools.
 
 The library APIs remain the primary integration surface.
@@ -126,6 +146,7 @@ The library APIs remain the primary integration surface.
 - Commands operate from the working-directory root.
 - The watch loop runs in the foreground.
 - One-shot commands construct fresh materializer instances, so hash-cache reuse primarily benefits long-running watch sessions.
+- Branch/switch commands expose the current branch-ref implementation.
 - Parent-directory discovery, background daemons, and multi-workspace supervision are future work.
 
 ## Future seams

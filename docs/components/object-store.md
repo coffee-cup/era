@@ -2,7 +2,7 @@
 
 `era-object-store` is the content-addressed persistence layer. It stores immutable blob, tree, and snapshot objects by their core object IDs and verifies that retrieved bytes still match the ID that names them.
 
-The object store is deliberately unaware of branches, working directories, labels, and snapshot policy. It answers one question: given an immutable object, can Era store it, retrieve it, deduplicate it, and detect corruption?
+The object store is deliberately unaware of refs, workspace cursors, working directories, labels, and snapshot policy. It answers one question: given an immutable object, can Era store it, retrieve it, deduplicate it, and detect corruption?
 
 ## High-level structure
 
@@ -83,7 +83,7 @@ return verified object
 The object store does not:
 
 - Know which snapshot is current.
-- Manage branch names, refs, or HEAD state.
+- Manage branch names, refs, workspace cursors, or HEAD state.
 - Walk, watch, or restore working directories.
 - Decide whether a snapshot is meaningful or automatic.
 - Apply tracking or ignore policy.
@@ -110,7 +110,7 @@ Those decisions are made above this layer.
 └───────────────────────┘
 ```
 
-Materialization writes blobs and trees while capturing a working directory. Repository writes snapshots and reads historical objects while serving branch, status, timeline, switch, and restore operations.
+Materialization writes blobs and trees while capturing a working directory. Repository writes snapshots and reads historical objects while serving status, timeline, context switching, and restore operations.
 
 ## v0 constraints
 
