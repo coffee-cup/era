@@ -1,15 +1,26 @@
-use crate::{ObjectStore, ObjectStoreError};
+use crate::{
+    ObjectStore, ObjectStoreError,
+    blob_delta::{self, BlobDelta},
+};
 use async_trait::async_trait;
 use era_core::{ObjectId, ObjectKind, Snapshot, Tree};
 use std::{
+    future::Future,
     io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::atomic::{AtomicU64, Ordering},
 };
 use tokio::{fs, fs::OpenOptions, io::AsyncWriteExt};
 use tracing::{debug, warn};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct BlobRead {
+    bytes: Vec<u8>,
+    depth: u32,
+}
 
 /// Local filesystem-backed content-addressed object store.
 ///
@@ -52,13 +63,30 @@ impl LocalObjectStore {
         bytes: impl AsRef<[u8]> + Send,
     ) -> Result<ObjectId, ObjectStoreError> {
         let bytes = bytes.as_ref();
+        self.put_blob_with_base(bytes, None).await
+    }
+
+    /// Stores blob bytes, optionally using another stored blob as a physical delta base.
+    pub async fn put_blob_with_base(
+        &self,
+        bytes: impl AsRef<[u8]> + Send,
+        base_id: Option<&ObjectId>,
+    ) -> Result<ObjectId, ObjectStoreError> {
+        let bytes = bytes.as_ref();
         let id = ObjectId::from_content(bytes);
-        self.put_object(ObjectKind::Blob, id, bytes).await
+        let storage = match base_id
+            .filter(|base_id| **base_id != id && bytes.len() >= blob_delta::MIN_DELTA_TARGET_BYTES)
+        {
+            Some(base_id) => self.delta_storage_bytes(bytes, *base_id).await,
+            None => None,
+        };
+        self.put_object(ObjectKind::Blob, id, storage.as_deref().unwrap_or(bytes))
+            .await
     }
 
     /// Reads blob bytes by object ID and verifies their integrity.
     pub async fn get_blob(&self, id: &ObjectId) -> Result<Vec<u8>, ObjectStoreError> {
-        self.get_object_bytes(ObjectKind::Blob, id).await
+        Ok(self.read_blob_data(*id).await?.bytes)
     }
 
     /// Stores a tree and returns the ID of its canonical serialized bytes.
@@ -235,6 +263,115 @@ impl LocalObjectStore {
         self.object_path(ObjectKind::Snapshot, id)
     }
 
+    async fn delta_storage_bytes(&self, bytes: &[u8], base_id: ObjectId) -> Option<Vec<u8>> {
+        match self.read_blob_data(base_id).await {
+            Ok(base) => BlobDelta::create(base_id, &base.bytes, base.depth, bytes).map(|delta| {
+                let encoded = delta.encode();
+                debug!(
+                    %base_id,
+                    depth = delta.depth,
+                    target_bytes = bytes.len(),
+                    stored_bytes = encoded.len(),
+                    "storing blob as delta"
+                );
+                encoded
+            }),
+            Err(error) => {
+                debug!(%base_id, error = %error, "blob delta base unavailable; storing full blob");
+                None
+            }
+        }
+    }
+
+    fn read_blob_data(
+        &self,
+        id: ObjectId,
+    ) -> Pin<Box<dyn Future<Output = Result<BlobRead, ObjectStoreError>> + Send + '_>> {
+        let path = self.blob_path(&id);
+        self.read_blob_data_at(path, id, 0)
+    }
+
+    fn read_blob_data_at(
+        &self,
+        path: PathBuf,
+        id: ObjectId,
+        recursion_depth: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<BlobRead, ObjectStoreError>> + Send + '_>> {
+        Box::pin(async move {
+            if recursion_depth > crate::blob_delta::MAX_DELTA_CHAIN_DEPTH {
+                return Err(ObjectStoreError::BlobDeltaChainTooDeep { id, path });
+            }
+
+            let stored = read_object_file(ObjectKind::Blob, &path, id).await?;
+            let raw_hash = ObjectId::from_content(&stored);
+            if raw_hash == id {
+                return Ok(BlobRead {
+                    bytes: stored,
+                    depth: 0,
+                });
+            }
+
+            let Some(delta) = BlobDelta::decode(&stored).map_err(|reason| {
+                ObjectStoreError::InvalidBlobDelta {
+                    id,
+                    path: path.clone(),
+                    reason,
+                }
+            })?
+            else {
+                warn!(kind = %ObjectKind::Blob, %id, actual = %raw_hash, path = %path.display(), "object failed integrity check on read");
+                return Err(ObjectStoreError::HashMismatch {
+                    kind: ObjectKind::Blob,
+                    path,
+                    expected: id,
+                    actual: raw_hash,
+                });
+            };
+
+            if delta.depth > crate::blob_delta::MAX_DELTA_CHAIN_DEPTH {
+                return Err(ObjectStoreError::BlobDeltaChainTooDeep { id, path });
+            }
+
+            let base = self
+                .read_blob_data_at(
+                    self.blob_path(&delta.base_id),
+                    delta.base_id,
+                    recursion_depth + 1,
+                )
+                .await?;
+            if delta.depth != base.depth + 1 {
+                return Err(ObjectStoreError::InvalidBlobDelta {
+                    id,
+                    path,
+                    reason: "blob delta chain depth does not match base".to_owned(),
+                });
+            }
+
+            let bytes = delta.reconstruct(&base.bytes).map_err(|reason| {
+                ObjectStoreError::InvalidBlobDelta {
+                    id,
+                    path: path.clone(),
+                    reason,
+                }
+            })?;
+            let actual = ObjectId::from_content(&bytes);
+            if actual != id {
+                warn!(kind = %ObjectKind::Blob, %id, %actual, path = %path.display(), "object failed integrity check on read");
+                return Err(ObjectStoreError::HashMismatch {
+                    kind: ObjectKind::Blob,
+                    path,
+                    expected: id,
+                    actual,
+                });
+            }
+
+            Ok(BlobRead {
+                bytes,
+                depth: delta.depth,
+            })
+        })
+    }
+
     async fn put_object(
         &self,
         kind: ObjectKind,
@@ -294,6 +431,10 @@ impl LocalObjectStore {
         kind: ObjectKind,
         id: &ObjectId,
     ) -> Result<Vec<u8>, ObjectStoreError> {
+        if kind == ObjectKind::Blob {
+            return self.get_blob(id).await;
+        }
+
         let path = self.object_path(kind, id);
         debug!(%kind, %id, path = %path.display(), "reading object");
         let bytes = read_object_file(kind, &path, *id).await?;
@@ -385,6 +526,12 @@ impl LocalObjectStore {
         path: &Path,
         expected: ObjectId,
     ) -> Result<(), ObjectStoreError> {
+        if kind == ObjectKind::Blob {
+            self.read_blob_data_at(path.to_path_buf(), expected, 0)
+                .await?;
+            return Ok(());
+        }
+
         let bytes = read_object_file(kind, path, expected).await?;
         let actual = ObjectId::from_content(bytes);
         if actual != expected {
@@ -404,6 +551,14 @@ impl LocalObjectStore {
 impl ObjectStore for LocalObjectStore {
     async fn put_blob(&self, bytes: &[u8]) -> Result<ObjectId, ObjectStoreError> {
         LocalObjectStore::put_blob(self, bytes).await
+    }
+
+    async fn put_blob_with_base(
+        &self,
+        bytes: &[u8],
+        base_id: Option<&ObjectId>,
+    ) -> Result<ObjectId, ObjectStoreError> {
+        LocalObjectStore::put_blob_with_base(self, bytes, base_id).await
     }
 
     async fn get_blob(&self, id: &ObjectId) -> Result<Vec<u8>, ObjectStoreError> {

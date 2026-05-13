@@ -429,6 +429,7 @@ name = "era-object-store"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "criterion",
  "era-core",
  "tempfile",
  "tokio",

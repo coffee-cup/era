@@ -501,6 +501,143 @@ async fn large_blob_round_trips() {
     assert_eq!(temp_file_count(store.root(), ObjectKind::Blob).await, 0);
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn raw_blob_with_delta_magic_prefix_round_trips() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let bytes = b"era-blob-delta-v1\nraw file contents";
+
+    let id = store.put_blob(bytes).await.unwrap();
+
+    assert_eq!(store.get_blob(&id).await.unwrap(), bytes);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn small_large_blob_edit_stores_compact_delta() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let base = vec![b'a'; 128 * 1024];
+    let base_id = store.put_blob(&base).await.unwrap();
+    let mut changed = base.clone();
+    changed[64 * 1024] = b'b';
+
+    let changed_id = store
+        .put_blob_with_base(&changed, Some(&base_id))
+        .await
+        .unwrap();
+
+    assert_eq!(changed_id, ObjectId::from_content(&changed));
+    assert_eq!(store.get_blob(&changed_id).await.unwrap(), changed);
+    assert!(
+        fs::metadata(store.blob_path(&changed_id))
+            .await
+            .unwrap()
+            .len()
+            < 1024
+    );
+    assert_eq!(object_file_count(store.root(), ObjectKind::Blob).await, 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insertion_and_deletion_blob_deltas_round_trip() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let base = vec![b'a'; 128 * 1024];
+    let base_id = store.put_blob(&base).await.unwrap();
+
+    let mut inserted = base.clone();
+    inserted.splice(2048..2048, b"inserted bytes".iter().copied());
+    let inserted_id = store
+        .put_blob_with_base(&inserted, Some(&base_id))
+        .await
+        .unwrap();
+
+    let mut deleted = inserted.clone();
+    deleted.drain(4096..8192);
+    let deleted_id = store
+        .put_blob_with_base(&deleted, Some(&inserted_id))
+        .await
+        .unwrap();
+
+    assert_eq!(store.get_blob(&inserted_id).await.unwrap(), inserted);
+    assert_eq!(store.get_blob(&deleted_id).await.unwrap(), deleted);
+    assert!(
+        fs::metadata(store.blob_path(&inserted_id))
+            .await
+            .unwrap()
+            .len()
+            < 1024
+    );
+    assert!(
+        fs::metadata(store.blob_path(&deleted_id))
+            .await
+            .unwrap()
+            .len()
+            < 1024
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_delta_base_returns_clear_error() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let base = vec![b'a'; 128 * 1024];
+    let base_id = store.put_blob(&base).await.unwrap();
+    let mut changed = base.clone();
+    changed[100] = b'b';
+    let changed_id = store
+        .put_blob_with_base(&changed, Some(&base_id))
+        .await
+        .unwrap();
+    fs::remove_file(store.blob_path(&base_id)).await.unwrap();
+
+    let error = store.get_blob(&changed_id).await.unwrap_err();
+
+    assert!(matches!(
+        error,
+        ObjectStoreError::MissingObject {
+            kind: ObjectKind::Blob,
+            id,
+            ..
+        } if id == base_id
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn deep_delta_chains_fall_back_to_full_blob_storage() {
+    let temp = TempDir::new().unwrap();
+    let store = LocalObjectStore::open(temp.path().join("objects"))
+        .await
+        .unwrap();
+    let mut bytes = vec![b'a'; 128 * 1024];
+    let mut previous_id = store.put_blob(&bytes).await.unwrap();
+
+    for index in 0..=crate::blob_delta::MAX_DELTA_CHAIN_DEPTH {
+        bytes[index as usize] = b'b' + index as u8;
+        previous_id = store
+            .put_blob_with_base(&bytes, Some(&previous_id))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(store.get_blob(&previous_id).await.unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(store.blob_path(&previous_id))
+            .await
+            .unwrap()
+            .len(),
+        bytes.len() as u64
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_puts_of_same_blob_dedupe_and_cleanup_temps() {
     let temp = TempDir::new().unwrap();

@@ -43,7 +43,7 @@ A directory listing — an ordered set of named entries, each pointing to either
 
 In the current implementation, tree entries use UTF-8 single-segment names. Emoji and non-English characters are supported and preserved exactly; Unicode normalization is not applied. Empty names, `.`, `..`, names containing `/`, and names containing NUL are invalid.
 
-This is the object-level copy-on-write magic: changing a single file in a deeply nested directory writes a new blob for that full file, the tree containing it, and the trees on the path back to the root. Everything else is shared with the prior state. The current implementation does not do filesystem-level CoW, block-level chunking, or delta compression; if one byte changes in a large file, the changed file is stored as a new full blob.
+This is the object-level copy-on-write magic: changing a single file in a deeply nested directory writes a new logical blob, the tree containing it, and the trees on the path back to the root. Everything else is shared with the prior state. The local object store keeps blob IDs as hashes of full file bytes, but it can store large changed blobs physically as deltas against a previous blob when the materializer has a safe base hint. The current implementation does not do filesystem-level CoW or block-level chunking.
 
 ### State
 
@@ -116,7 +116,7 @@ Responsibilities:
 
 The object store has no notion of "current state" or "working directory." It is a key-value store where keys are content hashes and values are the immutable bytes of objects. The same object store can back any number of repositories or working directories.
 
-The implemented object-store slices cover an async object-store interface plus a local filesystem-backed implementation for blobs, trees, and snapshots. It uses BLAKE3 object IDs, stores objects under sharded `<kind>/<prefix>/<object-id>` directories, deduplicates identical bytes, and verifies hashes on read so corruption is surfaced immediately. Tree and snapshot objects are stored as deterministic canonical bytes and decoded with canonical-order validation. Local repositories place this store under `.era/objects`.
+The implemented object-store slices cover an async object-store interface plus a local filesystem-backed implementation for blobs, trees, and snapshots. It uses BLAKE3 object IDs, stores objects under sharded `<kind>/<prefix>/<object-id>` directories, deduplicates identical bytes, and verifies hashes on read so corruption is surfaced immediately. Blob files may be raw bytes or compact delta records that reconstruct to the requested full blob ID; tree and snapshot objects are stored as deterministic canonical bytes and decoded with canonical-order validation. Local repositories place this store under `.era/objects`.
 
 ### Materialization
 
@@ -352,7 +352,7 @@ To make the layers concrete, here is what happens when a file changes:
 2. **The materialization layer's watcher** observes the write and emits a change event.
 3. **The watch loop** debounces a series of such events and asks the repository for a changed-only automatic snapshot.
 4. **The repository asks the materializer** to compute the current tree state. For watch-triggered snapshots, the materializer uses dirty-path hints and cached tree structure to inspect changed paths and rebuild ancestors; reconciliation can still do a full scan.
-5. **For any file whose fingerprint changed**, the materializer hashes the bytes and hands new blob content to the object store. Cached unchanged files produce no blob I/O.
+5. **For any file whose fingerprint changed**, the materializer hashes the bytes and hands new blob content to the object store, along with a previous blob ID when the workspace cache or parent tree has one. Cached unchanged files produce no blob I/O; large changed blobs can be stored as physical deltas when that saves space.
 6. **The materializer builds tree objects** for changed directories and ancestors, writing only new tree objects to the object store. Cached unchanged directories are reused.
 7. **The repository builds a snapshot object** referencing the new root tree, the previous snapshot as its parent, the current timestamp, and any provenance supplied by the agent or user.
 8. **The repository updates the current workspace cursor / ref** to point at the new snapshot.

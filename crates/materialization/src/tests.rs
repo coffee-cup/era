@@ -771,6 +771,81 @@ async fn hinted_capture_rehashes_dirty_file_and_rebuilds_ancestors_only() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hinted_capture_uses_previous_blob_as_delta_base() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    let mut bytes = vec![b'a'; 128 * 1024];
+    fs::write(work.join("large.bin"), &bytes).await.unwrap();
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+
+    FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    bytes[64 * 1024] = b'b';
+    fs::write(work.join("large.bin"), &bytes).await.unwrap();
+
+    let hinted = FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree_with_hints(
+            &WorkingDirectory::new(&work),
+            &store,
+            &[PathBuf::from("large.bin")],
+        )
+        .await
+        .unwrap();
+    let root = store.get_tree(&hinted.root_tree_id).await.unwrap();
+    let blob_id = entry(&root, "large.bin").id();
+
+    assert_eq!(store.get_blob(&blob_id).await.unwrap(), bytes);
+    assert!(fs::metadata(store.blob_path(&blob_id)).await.unwrap().len() < 1024);
+
+    bytes[32 * 1024] = b'c';
+    fs::write(work.join("large.bin"), &bytes).await.unwrap();
+    let full = FilesystemMaterializer::with_cache_path(&cache_path)
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    let root = store.get_tree(&full.root_tree_id).await.unwrap();
+    let blob_id = entry(&root, "large.bin").id();
+
+    assert_eq!(store.get_blob(&blob_id).await.unwrap(), bytes);
+    assert!(fs::metadata(store.blob_path(&blob_id)).await.unwrap().len() < 1024);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn status_scan_preserves_delta_base_for_later_capture() {
+    let temp = TempDir::new().unwrap();
+    let work = create_workdir(&temp).await;
+    let mut bytes = vec![b'a'; 128 * 1024];
+    fs::write(work.join("large.bin"), &bytes).await.unwrap();
+    let store = open_store(&temp).await;
+    let cache_path = temp.path().join("cache/capture-v2.redb");
+    let materializer = FilesystemMaterializer::with_cache_path(&cache_path);
+
+    materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    bytes[64 * 1024] = b'b';
+    fs::write(work.join("large.bin"), &bytes).await.unwrap();
+    materializer
+        .scan_tree(&WorkingDirectory::new(&work))
+        .await
+        .unwrap();
+
+    let captured = materializer
+        .capture_tree(&WorkingDirectory::new(&work), &store)
+        .await
+        .unwrap();
+    let root = store.get_tree(&captured.root_tree_id).await.unwrap();
+    let blob_id = entry(&root, "large.bin").id();
+
+    assert_eq!(store.get_blob(&blob_id).await.unwrap(), bytes);
+    assert!(fs::metadata(store.blob_path(&blob_id)).await.unwrap().len() < 1024);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn hinted_capture_handles_add_delete_and_type_changes() {
     let temp = TempDir::new().unwrap();
     let work = create_workdir(&temp).await;

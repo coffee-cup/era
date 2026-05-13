@@ -11,7 +11,7 @@ The object store is deliberately unaware of refs, workspace cursors, working dir
 │ era-object-store                             │
 ├──────────────────────────────────────────────┤
 │ ObjectStore capability                       │
-│  - put/get blobs                             │
+│  - put/get blobs, with optional base hints   │
 │  - put/get trees                             │
 │  - put/get snapshots                         │
 │  - list snapshot IDs for index rebuilds      │
@@ -21,6 +21,7 @@ The object store is deliberately unaware of refs, workspace cursors, working dir
 │  - sharded content-addressed layout          │
 │  - race-safe writes                          │
 │  - transparent deduplication                 │
+│  - transparent large-blob delta storage      │
 │  - hash verification on read                 │
 └──────────────────────────────────────────────┘
 ```
@@ -43,9 +44,11 @@ content hash / expected object ID
    ▼
 local content-addressed storage
    │
-   ├─ object already exists ──► reuse existing bytes
+   ├─ object already exists ──► reuse existing representation
    │
-   └─ object is new ─────────► write immutable bytes
+   ├─ blob has useful base ───► write compact delta representation
+   │
+   └─ object is new ─────────► write immutable raw bytes
    │
    ▼
 return object ID
@@ -57,10 +60,13 @@ return object ID
 requested object ID
    │
    ▼
-load stored bytes
+load stored representation
+   │
+   ├─ raw bytes ──────────────► use directly
+   └─ blob delta ─────────────► reconstruct from stored base blob
    │
    ▼
-verify content hash matches requested ID
+verify full content hash matches requested ID
    │
    ├─ mismatch ──► surface corruption
    │
@@ -75,7 +81,8 @@ return verified object
 
 - Persist blobs, trees, and snapshots as immutable content-addressed objects.
 - Deduplicate identical object bytes.
-- Verify object integrity on reads.
+- Store large changed blobs as physical deltas when a base blob is supplied and the delta is smaller.
+- Verify object integrity on reads after reconstructing any delta-backed blob.
 - Preserve deterministic tree and snapshot encodings provided by the core model.
 - List snapshot object IDs so repository-owned graph indexes can be rebuilt from local objects.
 - Expose an async capability interface for higher layers.
@@ -118,10 +125,13 @@ Materialization writes blobs and trees while capturing a working directory. Repo
 
 - The implemented store is local filesystem-backed.
 - Objects are grouped by kind and sharded by object ID prefix.
-- Blobs are whole-file objects; there is no block-level chunking or delta compression.
+- Blob IDs remain whole-file content hashes. Local blob files can be either raw bytes or delta records against another stored blob.
+- Delta records use common prefix/suffix compression for localized large-file edits, fall back to raw bytes when not beneficial, and cap chain depth to bound restore/read cost.
+- Delta storage reduces stored bytes, not the need to read and verify full logical blob contents during capture and restore.
+- There is no block-level chunking or content-defined chunk index yet.
 - Snapshot ID listing is used for local index rebuilds; query planning and graph policy remain repository responsibilities.
 - Garbage collection, network sync, encryption, and remote storage are outside v0.
 
 ## Future seams
 
-The object-store capability can grow additional implementations for remote stores, encrypted stores, or sync-aware stores. Those additions should preserve the same boundary: immutable objects go in and verified immutable objects come out.
+The object-store capability can grow additional implementations for remote stores, encrypted stores, sync-aware stores, packed storage, or content-defined chunking. Those additions should preserve the same boundary: immutable logical objects go in and verified immutable logical objects come out.

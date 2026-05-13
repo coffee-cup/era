@@ -1,5 +1,6 @@
 //! Content-addressed object storage abstractions.
 
+mod blob_delta;
 mod error;
 mod local;
 
@@ -18,6 +19,16 @@ pub use local::LocalObjectStore;
 pub trait ObjectStore: Send + Sync {
     /// Stores blob bytes and returns their content-addressed object ID.
     async fn put_blob(&self, bytes: &[u8]) -> Result<ObjectId, ObjectStoreError>;
+
+    /// Stores blob bytes, optionally using another stored blob as a physical delta base.
+    async fn put_blob_with_base(
+        &self,
+        bytes: &[u8],
+        base_id: Option<&ObjectId>,
+    ) -> Result<ObjectId, ObjectStoreError> {
+        let _ = base_id;
+        self.put_blob(bytes).await
+    }
 
     /// Reads blob bytes by object ID and verifies their integrity.
     async fn get_blob(&self, id: &ObjectId) -> Result<Vec<u8>, ObjectStoreError>;

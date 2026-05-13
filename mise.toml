@@ -20,6 +20,7 @@ run = "cargo test --workspace --all-targets"
 [tasks.bench]
 description = "Run Rust benchmarks"
 run = [
+    "cargo bench -p era-object-store --bench blob_delta",
     "cargo bench -p era-materialization --bench capture",
     "cargo bench -p era-repository --bench snapshot",
 ]

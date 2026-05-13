@@ -14,7 +14,7 @@ use std::os::unix::fs::MetadataExt;
 
 const FILES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const DIRECTORIES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("directories");
-const FILE_RECORD_VERSION: u8 = 1;
+const FILE_RECORD_VERSION: u8 = 2;
 const DIRECTORY_RECORD_VERSION: u8 = 1;
 static DATABASE_REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Weak<Database>>>> = OnceLock::new();
 
@@ -173,12 +173,28 @@ impl CaptureCache {
         path: &Path,
         fingerprint: &FileFingerprint,
     ) -> Option<CachedFileHash> {
-        self.current_file(path)
-            .filter(|entry| entry.fingerprint == *fingerprint)
-            .map(|entry| CachedFileHash {
+        self.file_lookup(path, fingerprint).matching
+    }
+
+    pub(crate) fn file_lookup(
+        &mut self,
+        path: &Path,
+        fingerprint: &FileFingerprint,
+    ) -> CachedFileLookup {
+        let Some(entry) = self.current_file(path) else {
+            return CachedFileLookup::default();
+        };
+        CachedFileLookup {
+            matching: (entry.fingerprint == *fingerprint).then_some(CachedFileHash {
                 object_id: entry.object_id,
                 stored: entry.stored,
-            })
+            }),
+            stored_base_id: if entry.stored {
+                Some(entry.object_id)
+            } else {
+                entry.stored_base_id
+            },
+        }
     }
 
     pub(crate) fn insert_file(
@@ -194,10 +210,22 @@ impl CaptureCache {
             || previous
                 .as_ref()
                 .is_some_and(|entry| entry.object_id == object_id && entry.stored);
+        let stored_base_id = if stored {
+            None
+        } else {
+            previous.as_ref().and_then(|entry| {
+                if entry.stored {
+                    Some(entry.object_id)
+                } else {
+                    entry.stored_base_id
+                }
+            })
+        };
         let next = CachedFile {
             fingerprint,
             object_id,
             stored,
+            stored_base_id,
         };
         if previous.as_ref() == Some(&next) {
             self.files.insert(path, next);
@@ -428,6 +456,7 @@ struct CachedFile {
     fingerprint: FileFingerprint,
     object_id: ObjectId,
     stored: bool,
+    stored_base_id: Option<ObjectId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,6 +477,12 @@ pub(crate) struct CachedDirectoryTree {
 pub(crate) struct CachedFileHash {
     pub(crate) object_id: ObjectId,
     pub(crate) stored: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CachedFileLookup {
+    pub(crate) matching: Option<CachedFileHash>,
+    pub(crate) stored_base_id: Option<ObjectId>,
 }
 
 /// Filesystem metadata used to decide whether a cached file hash is reusable.
@@ -653,7 +688,9 @@ fn decode_key(value: &str) -> Result<PathBuf, String> {
 }
 
 fn encode_file(file: &CachedFile) -> Vec<u8> {
-    let mut output = Vec::with_capacity(1 + 1 + 8 + 1 + 8 + 4 + 1 + 8 + 1 + 8 + OBJECT_ID_BYTES);
+    let mut output = Vec::with_capacity(
+        1 + 1 + 8 + 1 + 8 + 4 + 1 + 8 + 1 + 8 + OBJECT_ID_BYTES + 1 + OBJECT_ID_BYTES,
+    );
     output.push(FILE_RECORD_VERSION);
     output.push(u8::from(file.stored));
     write_u64(&mut output, file.fingerprint.len());
@@ -664,12 +701,16 @@ fn encode_file(file: &CachedFile) -> Vec<u8> {
     write_optional_u64(&mut output, file.fingerprint.dev());
     write_optional_u64(&mut output, file.fingerprint.ino());
     output.extend_from_slice(file.object_id.as_bytes());
+    write_optional_object_id(&mut output, file.stored_base_id.as_ref());
     output
 }
 
 fn decode_file(bytes: &[u8]) -> Result<CachedFile, String> {
     let mut cursor = BytesCursor::new(bytes);
-    cursor.expect_version(FILE_RECORD_VERSION)?;
+    let version = cursor.read_u8()?;
+    if !matches!(version, 1 | FILE_RECORD_VERSION) {
+        return Err(format!("unsupported cache record version: {version}"));
+    }
     let stored = cursor.read_bool()?;
     let len = cursor.read_u64()?;
     let sign = cursor.read_u8()?;
@@ -679,11 +720,17 @@ fn decode_file(bytes: &[u8]) -> Result<CachedFile, String> {
     let dev = cursor.read_optional_u64()?;
     let ino = cursor.read_optional_u64()?;
     let object_id = cursor.read_object_id()?;
+    let stored_base_id = if version >= 2 {
+        cursor.read_optional_object_id()?
+    } else {
+        None
+    };
     cursor.finish()?;
     Ok(CachedFile {
         fingerprint: FileFingerprint::from_parts(len, modified, dev, ino)?,
         object_id,
         stored,
+        stored_base_id,
     })
 }
 
@@ -723,6 +770,19 @@ fn write_optional_u64(output: &mut Vec<u8>, value: Option<u64>) {
         None => {
             output.push(0);
             write_u64(output, 0);
+        }
+    }
+}
+
+fn write_optional_object_id(output: &mut Vec<u8>, value: Option<&ObjectId>) {
+    match value {
+        Some(value) => {
+            output.push(1);
+            output.extend_from_slice(value.as_bytes());
+        }
+        None => {
+            output.push(0);
+            output.extend_from_slice(&[0; OBJECT_ID_BYTES]);
         }
     }
 }
@@ -817,6 +877,12 @@ impl<'a> BytesCursor<'a> {
         let mut id = [0_u8; OBJECT_ID_BYTES];
         id.copy_from_slice(bytes);
         Ok(ObjectId::from_bytes(id))
+    }
+
+    fn read_optional_object_id(&mut self) -> Result<Option<ObjectId>, String> {
+        let present = self.read_bool()?;
+        let value = self.read_object_id()?;
+        Ok(present.then_some(value))
     }
 
     fn remaining(&self) -> &'a [u8] {

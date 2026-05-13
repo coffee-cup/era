@@ -12,13 +12,21 @@ pub enum ObjectStoreError {
         id: ObjectId,
         path: PathBuf,
     },
-    /// An object path existed, but its contents did not hash to the expected ID.
+    /// An object path existed, but its contents did not reconstruct to the expected ID.
     HashMismatch {
         kind: ObjectKind,
         path: PathBuf,
         expected: ObjectId,
         actual: ObjectId,
     },
+    /// A blob delta object could not be decoded or applied to its base.
+    InvalidBlobDelta {
+        id: ObjectId,
+        path: PathBuf,
+        reason: String,
+    },
+    /// A blob delta chain exceeded the local reconstruction cap.
+    BlobDeltaChainTooDeep { id: ObjectId, path: PathBuf },
     /// A tree object was hash-valid, but did not decode as canonical tree bytes.
     InvalidTreeObject {
         id: ObjectId,
@@ -64,6 +72,16 @@ impl fmt::Display for ObjectStoreError {
                 "{kind} object integrity check failed at {}: expected {expected}, got {actual}",
                 path.display()
             ),
+            Self::InvalidBlobDelta { id, path, reason } => write!(
+                formatter,
+                "blob object {id} at {} has an invalid delta representation: {reason}",
+                path.display()
+            ),
+            Self::BlobDeltaChainTooDeep { id, path } => write!(
+                formatter,
+                "blob object {id} at {} has a delta chain that is too deep",
+                path.display()
+            ),
             Self::InvalidTreeObject { id, path, source } => write!(
                 formatter,
                 "tree object {id} at {} is not canonical: {source}",
@@ -95,6 +113,8 @@ impl Error for ObjectStoreError {
             Self::InvalidSnapshotObject { source, .. } => Some(source),
             Self::MissingObject { .. }
             | Self::HashMismatch { .. }
+            | Self::InvalidBlobDelta { .. }
+            | Self::BlobDeltaChainTooDeep { .. }
             | Self::TempFileExhausted { .. } => None,
         }
     }

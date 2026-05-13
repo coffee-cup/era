@@ -456,8 +456,13 @@ impl FilesystemMaterializer {
                         })?,
                     )
                 } else if file_type.is_file() {
+                    let base_id = parent_directory
+                        .entries
+                        .iter()
+                        .find(|entry| entry.name() == name && entry.kind() == EntryKind::Blob)
+                        .map(|entry| entry.id());
                     let id = self
-                        .capture_current_file(&entry, object_store, stats)
+                        .capture_current_file(&entry, object_store, stats, base_id)
                         .await?;
                     Some(TreeEntry::blob(name.clone(), id).map_err(|source| {
                         MaterializationError::InvalidTreeEntry {
@@ -581,7 +586,7 @@ impl FilesystemMaterializer {
                     )?);
                 } else if entry.file_type.is_file() {
                     let id = self
-                        .capture_current_file(&entry, object_store, stats)
+                        .capture_current_file(&entry, object_store, stats, None)
                         .await?;
 
                     tree_entries.push(TreeEntry::blob(entry.name, id).map_err(|source| {
@@ -966,14 +971,15 @@ impl FilesystemMaterializer {
         entry: &DirectoryEntry,
         object_store: &dyn ObjectStore,
         stats: &mut CaptureStats,
+        base_id: Option<ObjectId>,
     ) -> Result<ObjectId, MaterializationError> {
         let metadata = fs::metadata(&entry.path)
             .await
             .map_err(|source| io_error(entry.path.clone(), source))?;
         let fingerprint = FileFingerprint::from_metadata(&metadata);
 
-        let cached_id = self.cached_file_id(&entry.relative_path, &fingerprint);
-        if let Some(cached) = cached_id
+        let cached = self.cached_file_lookup(&entry.relative_path, &fingerprint);
+        if let Some(cached) = cached.matching
             && cached.stored
         {
             stats.files_seen += 1;
@@ -982,10 +988,13 @@ impl FilesystemMaterializer {
             return Ok(cached.object_id);
         }
 
+        let base_id = base_id.or(cached.stored_base_id);
         let bytes = fs::read(&entry.path)
             .await
             .map_err(|source| io_error(entry.path.clone(), source))?;
-        let id = object_store.put_blob(&bytes).await?;
+        let id = object_store
+            .put_blob_with_base(&bytes, base_id.as_ref())
+            .await?;
 
         stats.files_seen += 1;
         stats.bytes_read += bytes.len() as u64;
@@ -1036,6 +1045,17 @@ impl FilesystemMaterializer {
             .lock()
             .expect("capture cache mutex poisoned")
             .get_file(path, fingerprint)
+    }
+
+    fn cached_file_lookup(
+        &self,
+        path: &Path,
+        fingerprint: &FileFingerprint,
+    ) -> crate::capture_cache::CachedFileLookup {
+        self.cache
+            .lock()
+            .expect("capture cache mutex poisoned")
+            .file_lookup(path, fingerprint)
     }
 
     fn store_cached_file_id(

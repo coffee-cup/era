@@ -120,7 +120,7 @@ Era is moving toward:
 The implemented foundation covers:
 
 - BLAKE3 object IDs and deterministic tree/snapshot formats.
-- Async local blob/tree/snapshot object storage.
+- Async local blob/tree/snapshot object storage with transparent large-blob deltas.
 - Working-directory capture, scan, comparison, and restore.
 - Path-aware status with added, modified, deleted, and type-changed paths.
 - Local branch refs, workspace refs, branch/workspace switching, and cursor-moving snapshot restore.
@@ -133,7 +133,7 @@ The implemented foundation covers:
 
 The foundation also includes a snapshot-agnostic text merge engine with structured conflicts; repository/CLI merge workflows are not wired yet.
 
-Notable future work includes object packing/deltas, garbage collection, snapshot retention policy, workspace fleet supervision, repository-level diff/merge flows, semantic merge strategies, tracking heuristics, provenance indexing/querying, and git interoperability.
+Notable future work includes object packing, garbage collection, snapshot retention policy, workspace fleet supervision, repository-level diff/merge flows, semantic merge strategies, tracking heuristics, provenance indexing/querying, and git interoperability.
 
 ## Prerequisites
 

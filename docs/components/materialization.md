@@ -38,6 +38,7 @@ walk included paths, or use dirty-path hints when provided
    ├─ skip excluded directories and `.era` workspace pointer files
    ├─ apply symlink policy
    ├─ reuse cached file hashes when fingerprints match
+   ├─ pass previous blob IDs as delta bases for changed files
    └─ reuse cached stored tree entries for unchanged directories
    │
    ▼
@@ -109,6 +110,7 @@ Filesystem watcher events are hints, not proof. Watch-triggered snapshots can us
 - Materialize a stored tree into a working directory.
 - Watch a working directory and emit filtered change hints.
 - Maintain capture-cache state scoped to one materialized workspace.
+- Supply safe previous-blob hints to the object store so large changed files can be stored as compact deltas.
 
 The persistent cache is an indexed redb database at the workspace cache path. Full tree operations may bulk-load cache records because they already walk the filesystem, while hinted captures use point lookups/updates and prefix invalidation so one dirty path does not require decoding or rewriting the entire cache. Cache writes skip fsync-level durability because the cache is rebuildable after corruption or loss.
 
@@ -154,4 +156,4 @@ Those policies belong to the repository and CLI layers.
 
 ## Future seams
 
-Hardlink, reflink, and FUSE materializers should plug into the same capability boundary. Capture caches should remain workspace-scoped rather than becoming shared object-store state; global storage efficiency belongs in object-store packing, indexes, and GC.
+Hardlink, reflink, and FUSE materializers should plug into the same capability boundary. Capture caches should remain workspace-scoped rather than becoming shared object-store state; global storage efficiency belongs in object-store deltas, packing, indexes, and GC.
